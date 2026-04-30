@@ -113,7 +113,81 @@ func TestHTTPGoldenCorrectionLoop(t *testing.T) {
 	}
 }
 
+func TestHTTPTenantContextComesFromAuthToken(t *testing.T) {
+	application := app.New(memory.New())
+	server := httptest.NewServer(httpapi.New(application).Handler())
+	t.Cleanup(server.Close)
+
+	var tenantA struct {
+		Tenant domain.Tenant `json:"tenant"`
+	}
+	post(t, server.URL+"/admin/tenants", "", map[string]any{
+		"name":            "Tenant A",
+		"vertical":        "roofing",
+		"provider_number": "+61400000000",
+		"operator_id":     "op_telegram:a",
+	}, &tenantA, http.StatusCreated)
+
+	var tenantB struct {
+		Tenant domain.Tenant `json:"tenant"`
+	}
+	post(t, server.URL+"/admin/tenants", "", map[string]any{
+		"name":            "Tenant B",
+		"vertical":        "roofing",
+		"provider_number": "+61400000001",
+		"operator_id":     "op_telegram:b",
+	}, &tenantB, http.StatusCreated)
+
+	var start struct {
+		CaseRun domain.CaseRun `json:"case_run"`
+	}
+	post(t, server.URL+"/cases", tenantA.Tenant.ID, map[string]any{
+		"tenant_id":     tenantB.Tenant.ID,
+		"workflow_slug": "quote_drafting",
+		"mode":          "sandbox",
+		"payload": map[string]any{
+			"sandbox":         true,
+			"client_type":     "new",
+			"photos_complete": false,
+		},
+	}, nil, http.StatusBadRequest)
+
+	postWithHeaders(t, server.URL+"/cases", map[string]string{
+		"Content-Type":            "application/json",
+		"Authorization":           "Bearer tid:" + tenantA.Tenant.ID,
+		"X-Victoria-Tenant-Id":    tenantB.Tenant.ID,
+		"X-Forwarded-Tenant-Id":   tenantB.Tenant.ID,
+		"X-Requested-Tenant-Id":   tenantB.Tenant.ID,
+		"X-Victoria-Operator-Id":  "op_telegram:b",
+		"X-Client-Supplied-Tid":   tenantB.Tenant.ID,
+		"X-Another-Forged-Header": tenantB.Tenant.ID,
+	}, map[string]any{
+		"workflow_slug": "quote_drafting",
+		"mode":          "sandbox",
+		"payload": map[string]any{
+			"sandbox":         true,
+			"client_type":     "new",
+			"photos_complete": false,
+		},
+	}, &start, http.StatusCreated)
+	if start.CaseRun.TenantID != tenantA.Tenant.ID {
+		t.Fatalf("case tenant = %s, want auth tenant %s", start.CaseRun.TenantID, tenantA.Tenant.ID)
+	}
+
+	get(t, server.URL+"/candidates", "", nil, http.StatusUnauthorized)
+	get(t, server.URL+"/skill-versions/active?workflow_slug=quote_drafting", tenantB.Tenant.ID, nil, http.StatusOK)
+}
+
 func post(t *testing.T, url string, tenantID string, body any, out any, wantStatus int) {
+	t.Helper()
+	headers := map[string]string{"Content-Type": "application/json"}
+	if tenantID != "" {
+		headers["Authorization"] = "Bearer tid:" + tenantID
+	}
+	postWithHeaders(t, url, headers, body, out, wantStatus)
+}
+
+func postWithHeaders(t *testing.T, url string, headers map[string]string, body any, out any, wantStatus int) {
 	t.Helper()
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -123,9 +197,8 @@ func post(t *testing.T, url string, tenantID string, body any, out any, wantStat
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if tenantID != "" {
-		req.Header.Set("Authorization", "Bearer tid:"+tenantID)
+	for key, value := range headers {
+		req.Header.Set(key, value)
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
