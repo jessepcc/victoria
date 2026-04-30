@@ -10,7 +10,7 @@
 | | Anti-ICP: operations teams already using structured CRMs, workflow builders, project boards, or dedicated back-office staff. | Pick a single initial vertical for the first 10 users (e.g., Residential Trades: Roofers, Plumbers, Landscapers). |
 | | Tighter ICP sentence: `Owner-operators of small service businesses who run quoting and customer communication from their phone, inbox, messaging apps, and informal notes, and who are not comfortable setting up or maintaining SaaS workflow tools.` | |
 
-### Edit to doc
+### Reviewed Comment
 ICP: "Deskless Solo Operator."
 Operators who run 100k-1M+/yr businesses entirely via phone calls, SMS/iMessage, email, and pocket notepads. They view logging into a SaaS dashboard on a laptop as a chore they avoid until Sunday night.
 
@@ -29,7 +29,7 @@ Anti-ICP: operations teams already using structured CRMs, workflow builders, pro
 | A VA or office manager — the true incumbent; expensive, inconsistent, but requires zero tech adoption | | |
 | Explain why correction-first beats all of these for this specific user. | | |
 
-### Edit to doc
+### Reviewed Comment
 consolidate both comments, no conflicts
 
 ## Problem / Pain Points
@@ -40,7 +40,7 @@ consolidate both comments, no conflicts
 | | Spell out the pain more sharply: `slow response times`, `missed follow-ups`, `inconsistent quoting`, `knowledge trapped in the owner`, `no clean handoff to software` | |
 | | Clarify why existing workflow tools fail for this ICP: `too much upfront setup`, `too much abstraction`, `requires process clarity they do not have time to articulate`, `does not fit phone-first behavior` | |
 
-### Edit to doc
+### Reviewed Comment
 Add all problems/pain points to doc
 
 ## Solution / Value Proposition
@@ -52,7 +52,7 @@ Add all problems/pain points to doc
 | | Add a short "why this, not that" section comparing: `manual assistant`, `workflow builder`, `generic AI chatbot`, `traditional RPA/ops tooling` | |
 | | Be explicit about what the product is not: not a workflow builder, not an ops dashboard, not a Zapier-for-SMBs tool. | |
 
-### Edit to doc
+### Reviewed Comment
 
 Both Advisor 2 and 3 are on the right track but does not precisly caught the gist. It could be better decribed as dry run of the real workflow, ie "handle request for quotation from a new customer", "appointment change", "monthend account close" that dummy data are run against a default workflow in a sandboxed envrionment, ask user for input if required in the workflow, input and output are presented to users. Then user can comment and point out what is wrong.
 
@@ -64,7 +64,7 @@ Both Advisor 2 and 3 are on the right track but does not precisly caught the gis
 | | Best candidate: `small service-business owner-operator`, `quote/proposal drafting from inbound enquiry + photos` | |
 | | Why this wedge is strong: `high value per successful run`, `artifacts are easy to preview`, `approval is natural`, `mobile review fits behavior`, `ties directly to revenue` | |
 
-### edit to doc
+### Reviewed Comment
 
 I would like to go creative here.
 
@@ -94,7 +94,7 @@ The domain/vertical of the user can be obtained from 1) landing page referral 2)
 | Acquisition motion: Concierge-first for the first 5-10, then case-study-driven word of mouth | First wedge message: `reply to enquiries and draft quotes from your phone without setting up a system` | |
 | Pricing signal: Even a hypothesis (e.g., "$X/month replaces Y hours of admin") | Clarify why this segment is reachable: `concentrated local/service niches`, `clear pain`, `fast ROI`, `low need for broad org buy-in` | |
 
-### edit to doc
+### Reviewed Comment
 consolidate both comments, they refer to the same thing
 
 ## Why Now
@@ -106,7 +106,7 @@ consolidate both comments, they refer to the same thing
 | Post-COVID comfort with chat-as-business-tool among non-tech users | | |
 | Cost of LLM inference has dropped enough to make per-small-business economics viable | | |
 
-### edit to doc
+### Reviewed Comment
 do not need this section
 
 ## Evidence / Validation
@@ -118,7 +118,7 @@ do not need this section
 | 2-3 concierge pilots (you act as the agent manually) | Add one statement about behavior change threshold: `the user will adopt this if it saves time immediately without forcing them into a new operating system` | |
 | Confirm: Do they engage with correction packets? Do corrections yield reusable rules? Will they pay, and how much? | Add stronger proof that this problem is real and painful, not just plausible. | |
 
-### edit to doc
+### Reviewed Comment
 
 skip this, we are going lottery machine mode. The need is validated, a real pain killer UI is yet to be merged in market
 
@@ -131,7 +131,7 @@ skip this, we are going lottery machine mode. The need is validated, a real pain
 | | | White-Glove Start: For the MVP, onboarding consists of them forwarding an email or adding a phone number to their iMessage/WhatsApp group. |
 | | | Pre-Seeded Logic: The system must not start with a blank slate. If Joe is a roofer, Victoria loads the "Standard Roofing Template." The initial corrections are just fine-tuning, not teaching the agent what a roof is from scratch. |
 
-### Edit to doc
+### Reviewed Comment
 
 skip this, info are covered in other parts
 
@@ -143,7 +143,7 @@ skip this, info are covered in other parts
 | | | Developers, crypto operators, and founders use Telegram. Tradespeople and solo operators in North America/Europe use SMS (iMessage) or WhatsApp. |
 | | | Change the messaging gateway MVP to Twilio SMS or WhatsApp Business. They need to be able to reply simply with: "Change the price to $450 and send it." |
 
-### edit to doc
+### Reviewed Comment
 Whatsapp as the main channel, target is to obtain a specific number for each client. Whatsapp business is not feasible at the demo/pilot stage.
 Reference how openclaw and hermes mananged to do it.
 https://cloud.tencent.com/developer/article/2639118
@@ -159,7 +159,7 @@ Use telegram as a dev channel as it is quicker to setup
 | | MVP should likely be: `Telegram-first`, `one workflow only`, `sandbox artifacts only`, `approve/correct loop`, `candidate rules`, `human-reviewed promotion` | |
 | | Explicitly cut from MVP: `multiple workflows`, `multiple channels`, `broad live integrations`, `autonomous execution beyond drafts` | |
 
-### edit to doc
+### Reviewed Comment
 
 MVP should include Whatsapp first, also include telegram channel,  `sandbox artifacts only`, `approve/correct loop`, `candidate rules`, `human-reviewed promotion` are ok, but multiple workflows should be available
 Good, Explicitly cut from MVP: `multiple workflows`, `multiple channels`, `broad live integrations`, `autonomous execution beyond drafts`
@@ -173,7 +173,7 @@ Good, Explicitly cut from MVP: `multiple workflows`, `multiple channels`, `broad
 | Phase 0 success criteria: e.g., 3 active tenants, first validated rule promoted within 2 weeks, operator responds to >80% of review packets | Launch metrics: `time to first useful draft`, `approval rate`, `correction rate by type`, `time saved per case`, `repeat usage per week`, `promotion rate from sandbox to approval-gated mode` | MVP Success Criteria: "5 active deskless operators, executing >20 operational loops per week, interacting entirely via SMS/WhatsApp, with a correction-to-approval ratio dropping over a 4-week period." |
 | Leading indicators: Time-to-first-correction, correction-to-rule conversion rate, operator response latency | | |
 
-### edit to doc
+### Reviewed Comment
 
 North Star Metric: "Autopilot Promotion Rate" — the percentage of workflow branches a user upgrades from Approval Required to Autopilot. This proves trust.
 
@@ -191,7 +191,7 @@ Launch Success criteria: 3 active deskless operators, executing >10 operational 
 | | Artifact previews are sufficient for confidence. | |
 | | Internal rule review can bridge quality early on without destroying margins or speed. | |
 
-### edit to doc
+### Reviewed Comment
 
 Remove this part, does not provide useful information
 
@@ -204,7 +204,7 @@ Remove this part, does not provide useful information
 | | | Adopt Logical Isolation: Use a single shared Postgres cluster with Row-Level Security (RLS). Use a shared, stateless compute pool for the Temporal workers and agent runtime. |
 | | | Runtime Secret Injection: Keep tenant secrets in a secure vault (like Doppler or AWS Secrets Manager) and inject them dynamically into the MCP tools only at the exact moment of workflow execution. |
 
-### edit to doc
+### Reviewed Comment
 
 ignore comments from advisor 3, complete isolation is essential
 
@@ -216,7 +216,7 @@ ignore comments from advisor 3, complete isolation is essential
 | | | Agent as a Stateless Worker: Make it explicitly clear that the Agent/Hermes local disk is *not* the source of truth for business rules. |
 | | | DB as the Moat: The Postgres database holds the `ValidatedRule` data. Before a workflow runs, the Control Plane pulls the specific rules for that tenant and injects them into the Agent's system prompt or context window. The agent runs, finishes, and dies. |
 
-### edit to doc 
+### Reviewed Comment 
 
 Ignore this section
 
@@ -228,6 +228,6 @@ Ignore this section
 | | Move technical architecture, isolation, and Hermes-specific sections later in the document. | |
 | | Put the front of the spec in this order: `ICP`, `problem`, `why now`, `solution`, `beachhead workflow`, `value proposition`, `evidence`, `GTM`, `metrics`, `risks`, `architecture` | |
 
-### edit to doc
+### Reviewed Comment
 
 Adopt comments from advisor 2
