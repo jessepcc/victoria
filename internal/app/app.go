@@ -295,6 +295,56 @@ func (a *App) LoadSkillVersion(ctx context.Context, tenantID, workflowSlug strin
 	return a.store.ActiveSkillVersion(ctx, tenantID, workflowSlug)
 }
 
+type VerticalAggregate struct {
+	WorkflowSlug        string             `json:"workflow_slug"`
+	DecisionType        string             `json:"decision_type"`
+	ConditionsCanonical []domain.Condition `json:"conditions_canonical"`
+	RecommendedAction   string             `json:"recommended_action"`
+	EvidenceCount       int                `json:"evidence_count"`
+	Quarantined         bool               `json:"quarantined"`
+}
+
+func (a *App) BuildVerticalAggregates(ctx context.Context, vertical, workflowSlug string) ([]VerticalAggregate, []VerticalAggregate, error) {
+	tenants, err := a.store.ListTenants(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var safe []VerticalAggregate
+	var quarantined []VerticalAggregate
+	for _, tenant := range tenants {
+		if tenant.Vertical != vertical {
+			continue
+		}
+		candidates, err := a.store.ListCandidates(ctx, tenant.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, candidate := range candidates {
+			if candidate.WorkflowSlug != workflowSlug {
+				continue
+			}
+			conditions, quarantine := redactAggregateConditions(candidate.ConditionsCanonical)
+			aggregate := VerticalAggregate{
+				WorkflowSlug:        candidate.WorkflowSlug,
+				DecisionType:        candidate.DecisionType,
+				ConditionsCanonical: conditions,
+				RecommendedAction:   candidate.RecommendedAction,
+				EvidenceCount:       candidate.EvidenceCount,
+				Quarantined:         quarantine,
+			}
+			if quarantine {
+				quarantined = append(quarantined, aggregate)
+				_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenant.ID, "aggregate_quarantined", "system", "aggregation", "rule_candidate", candidate.ID, nil, map[string]any{
+					"workflow_slug": candidate.WorkflowSlug,
+				}, "aggregate-quarantine", tenant.ID, candidate.ID))
+				continue
+			}
+			safe = append(safe, aggregate)
+		}
+	}
+	return safe, quarantined, nil
+}
+
 func (a *App) CallMCPWriteFinal(ctx context.Context, boundTenantID string, serverMode domain.Mode, req domain.MCPRequest) (domain.MCPResult, error) {
 	now := a.clock.Now()
 	if req.TenantHeader != boundTenantID {
@@ -669,6 +719,11 @@ func structuredRuleFromCorrection(c domain.Correction, point domain.DecisionPoin
 		return []domain.Condition{{Field: "supplier_country", Operator: "!=", Value: "AU"}}, "apply_no_gst"
 	case strings.Contains(text, "commercial") && strings.Contains(text, "template"):
 		return []domain.Condition{{Field: "enquiry_type", Operator: "=", Value: "commercial"}}, "use_corporate_template"
+	case strings.Contains(text, "send it anyway") || strings.Contains(text, "go ahead"):
+		return []domain.Condition{
+			{Field: "photos_complete", Operator: "=", Value: boolValue(point.AgentInput, "photos_complete")},
+			{Field: "client_type", Operator: "=", Value: stringValue(point.AgentInput, "client_type", "new")},
+		}, "send_quote"
 	case strings.Contains(text, "repeat") || strings.Contains(text, "known client"):
 		return []domain.Condition{
 			{Field: "photos_complete", Operator: "=", Value: boolValue(point.AgentInput, "photos_complete")},
@@ -704,6 +759,41 @@ func conditionsMatch(payload map[string]any, conditions []domain.Condition) bool
 		}
 	}
 	return true
+}
+
+func redactAggregateConditions(conditions []domain.Condition) ([]domain.Condition, bool) {
+	out := make([]domain.Condition, 0, len(conditions))
+	quarantine := false
+	for _, condition := range conditions {
+		redacted := condition
+		value := fmt.Sprint(condition.Value)
+		lowerField := strings.ToLower(condition.Field)
+		switch {
+		case strings.Contains(value, "@"):
+			redacted.Value = "<email>"
+		case strings.Contains(lowerField, "client_name") || strings.Contains(lowerField, "customer_name"):
+			redacted.Value = "<quarantined:freetext>"
+			quarantine = true
+		case looksLikeFreeText(value):
+			redacted.Value = "<quarantined:freetext>"
+			quarantine = true
+		}
+		out = append(out, redacted)
+	}
+	return out, quarantine
+}
+
+func looksLikeFreeText(value string) bool {
+	if value == "" {
+		return false
+	}
+	allowed := map[string]struct{}{
+		"true": {}, "false": {}, "new": {}, "repeat": {}, "commercial": {}, "residential": {}, "AU": {}, "SG": {},
+	}
+	if _, ok := allowed[value]; ok {
+		return false
+	}
+	return strings.Contains(value, " ")
 }
 
 func factsFromPayload(payload map[string]any) []domain.Fact {
