@@ -227,6 +227,14 @@ func (a *App) ReceiveOperatorReply(ctx context.Context, input InboundReply) (dom
 	return a.gateway.ReceiveInbound(ctx, input, a.persistSignal)
 }
 
+func (a *App) DisconnectGateway(ctx context.Context, tenantID string) {
+	a.gateway.Disconnect(ctx, tenantID)
+}
+
+func (a *App) RecoverGateway(ctx context.Context, tenantID string) []domain.ReviewPacket {
+	return a.gateway.Recover(ctx, tenantID)
+}
+
 func (a *App) ListCandidates(ctx context.Context, tenantID string) ([]domain.RuleCandidate, error) {
 	return a.store.ListCandidates(ctx, tenantID)
 }
