@@ -93,6 +93,19 @@ func (a *App) ProvisionTenant(ctx context.Context, name, vertical, providerNumbe
 	if err := a.store.CreateTenant(ctx, tenant, manifest, binding, initialSV); err != nil {
 		return domain.Tenant{}, domain.ProvisioningManifest{}, err
 	}
+	for _, workflowSlug := range []string{"enquiry_triage", "invoice_handling"} {
+		if err := a.store.CreateSkillVersion(ctx, domain.SkillVersion{
+			ID:           a.ids.NewID("sv"),
+			TenantID:     tenant.ID,
+			WorkflowSlug: workflowSlug,
+			Version:      1,
+			RuleManifest: nil,
+			Status:       "active",
+			CreatedAt:    now,
+		}); err != nil {
+			return domain.Tenant{}, domain.ProvisioningManifest{}, err
+		}
+	}
 	_, err := a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, tenant.ID, "tenant_provisioned", "admin", "system", "tenant", tenant.ID, nil, map[string]any{
 		"vertical": tenant.Vertical,
 	}, "tenant-provisioned", tenant.ID))

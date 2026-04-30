@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"victoria/internal/app"
 	"victoria/internal/httpapi"
 	"victoria/internal/store/memory"
+	"victoria/internal/store/postgres"
 )
 
 func main() {
@@ -16,7 +18,19 @@ func main() {
 	if addr == "" {
 		addr = ":8080"
 	}
-	store := memory.New()
+	var store app.Store
+	if dsn := os.Getenv("VICTORIA_DATABASE_URL"); dsn != "" {
+		pgStore, err := postgres.Connect(context.Background(), dsn)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer pgStore.Close()
+		store = pgStore
+		log.Print("using postgres store")
+	} else {
+		store = memory.New()
+		log.Print("using in-memory store")
+	}
 	application := app.New(store)
 	server := &http.Server{
 		Addr:              addr,
