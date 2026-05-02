@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"victoria/internal/channel"
 	"victoria/internal/domain"
 )
 
@@ -89,8 +90,23 @@ func (a *App) ProvisionTenant(ctx context.Context, name, vertical, providerNumbe
 		Channel:        "telegram",
 		ProviderNumber: providerNumber,
 		OperatorID:     operatorID,
+		SessionStatus:  domain.SessionActive,
+		SessionUpdated: now,
 	}
 	if err := a.store.CreateTenant(ctx, tenant, manifest, binding, initialSV); err != nil {
+		return domain.Tenant{}, domain.ProvisioningManifest{}, err
+	}
+	// Pre-create the WhatsApp binding so the operator can pair from day 1.
+	// Status starts as qr_needed; pairing transitions it to connecting → active.
+	waBinding := domain.ChannelBinding{
+		TenantID:       tenant.ID,
+		Channel:        "whatsapp",
+		ProviderNumber: providerNumber,
+		OperatorID:     operatorID,
+		SessionStatus:  domain.SessionQRNeeded,
+		SessionUpdated: now,
+	}
+	if err := a.store.UpsertChannelBinding(ctx, waBinding); err != nil {
 		return domain.Tenant{}, domain.ProvisioningManifest{}, err
 	}
 	for _, workflowSlug := range []string{"enquiry_triage", "invoice_handling"} {
@@ -211,12 +227,13 @@ func (a *App) ReplayCase(ctx context.Context, input ReplayInput) (domain.CaseRun
 		return domain.CaseRun{}, err
 	}
 	now := a.clock.Now()
+	replayPayload := a.snapshotPayload(ctx, original)
 	replay := domain.CaseRun{
 		ID:                a.ids.NewID("cr"),
 		TenantID:          original.TenantID,
 		WorkflowSlug:      original.WorkflowSlug,
-		Mode:              domain.ModeSandbox,
-		InputPayload:      cloneMap(original.InputPayload),
+		Mode:              original.Mode,
+		InputPayload:      replayPayload,
 		InputHash:         original.InputHash,
 		SkillVersionID:    sv.ID,
 		ReplayedFromID:    original.ID,
@@ -236,6 +253,18 @@ func (a *App) ReplayCase(ctx context.Context, input ReplayInput) (domain.CaseRun
 	return replay, nil
 }
 
+func (a *App) snapshotPayload(ctx context.Context, original domain.CaseRun) map[string]any {
+	artifacts, err := a.store.ListArtifacts(ctx, original.TenantID, original.ID)
+	if err == nil {
+		for _, artifact := range artifacts {
+			if artifact.ArtifactType == "mcp_read_snapshot" {
+				return cloneMap(artifact.Content)
+			}
+		}
+	}
+	return cloneMap(original.InputPayload)
+}
+
 func (a *App) ReceiveOperatorReply(ctx context.Context, input InboundReply) (domain.ApprovalSignalEnvelope, error) {
 	return a.gateway.ReceiveInbound(ctx, input, a.persistSignal)
 }
@@ -248,12 +277,291 @@ func (a *App) RecoverGateway(ctx context.Context, tenantID string) []domain.Revi
 	return a.gateway.Recover(ctx, tenantID)
 }
 
+// RegisterChannelAdapter installs an outbound adapter (WhatsApp / Telegram).
+// Safe to call once at startup before the HTTP server begins accepting.
+func (a *App) RegisterChannelAdapter(adapter channel.Adapter) {
+	a.gateway.RegisterAdapter(adapter)
+}
+
+// GetChannelBinding returns the binding for a tenant on a specific channel.
+func (a *App) GetChannelBinding(ctx context.Context, tenantID, ch string) (domain.ChannelBinding, error) {
+	return a.store.ChannelBindingByTenant(ctx, tenantID, ch)
+}
+
+// HandleWhatsAppInbound translates an inbound WhatsApp message (already
+// normalized by the whatsmeow Manager) into the gateway's correction loop.
+//
+// Two-state conversation:
+//   1. If the gateway has a pending follow-up for this tenant (we previously
+//      asked "what should I have done?"), the current message is the
+//      correction reasoning — log it as a wrong_action correction and clear
+//      the follow-up state.
+//   2. Otherwise classify intent: yes/no/other. "no" without an inline
+//      reason starts a follow-up turn. "no with reason" or other substantive
+//      text becomes a correction immediately. "yes" approves; any text
+//      after "yes" rides along as a free-text note on the envelope.
+func (a *App) HandleWhatsAppInbound(ctx context.Context, tenantID string, msg channel.InboundMessage) error {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return fmt.Errorf("inbound: lookup binding: %w", err)
+	}
+	packetID := extractPacketReference(msg.FreeText)
+	if packetID == "" {
+		if latest, err := a.store.LatestReviewPacket(ctx, tenantID); err == nil {
+			packetID = latest.PacketID
+		}
+	}
+
+	// Path 1: a pending follow-up turn — current text is the correction reason.
+	if pendingPacket, ok := a.gateway.ConsumePendingFollowup(tenantID); ok {
+		if pendingPacket != "" {
+			packetID = pendingPacket
+		}
+		return a.dispatchInbound(ctx, tenantID, binding, packetID, msg, domain.ActionWrongAction, msg.FreeText)
+	}
+
+	intent := classifyIntent(msg.FreeText)
+	switch intent.kind {
+	case "approve":
+		return a.dispatchInbound(ctx, tenantID, binding, packetID, msg, domain.ActionApprove, intent.note)
+	case "reject_with_reason":
+		return a.dispatchInbound(ctx, tenantID, binding, packetID, msg, domain.ActionWrongAction, intent.note)
+	case "reject_need_followup":
+		// Stash the packet id so the next message is interpreted as the reason.
+		a.gateway.SetPendingFollowup(tenantID, packetID)
+		a.gateway.SendNotification(ctx, tenantID, "Got it — what should I have done instead? Just type the reason.")
+		return nil
+	case "promote":
+		return a.handlePromoteCommand(ctx, tenantID, binding.OperatorID)
+	case "correction":
+		// Power-user path: substantive prose without an explicit yes/no marker.
+		return a.dispatchInbound(ctx, tenantID, binding, packetID, msg, domain.ActionWrongAction, intent.note)
+	}
+
+	// Empty / unparseable.
+	_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "correction_dead_lettered", "operator", binding.OperatorID, "message", msg.ProviderMessageID, nil, map[string]any{
+		"channel":   string(channel.ChannelWhatsApp),
+		"packet_id": packetID,
+		"free_text": msg.FreeText,
+		"sender":    msg.SenderIdentifier,
+	}, "deadletter", tenantID, msg.ProviderMessageID))
+	return nil
+}
+
+// handlePromoteCommand resolves a `promote` reply by promoting the most-
+// recent under_review candidate for this tenant. Convenience for demo flows
+// — production deployments would route via the Rule Review Console (spec §7).
+func (a *App) handlePromoteCommand(ctx context.Context, tenantID, operatorID string) error {
+	candidates, err := a.store.ListCandidates(ctx, tenantID)
+	if err != nil {
+		return err
+	}
+	var pick domain.RuleCandidate
+	for _, c := range candidates {
+		if c.Status != "under_review" {
+			continue
+		}
+		if pick.ID == "" || (c.UnderReviewAt != nil && pick.UnderReviewAt != nil && c.UnderReviewAt.After(*pick.UnderReviewAt)) {
+			pick = c
+		}
+	}
+	if pick.ID == "" {
+		a.gateway.SendNotification(ctx, tenantID, "Nothing is ready for promotion yet — no candidate is under_review.")
+		return nil
+	}
+	rule, sv, err := a.PromoteCandidate(ctx, tenantID, pick.ID, "wa:"+operatorID, "promoted via WhatsApp command")
+	if err != nil {
+		a.gateway.SendNotification(ctx, tenantID, fmt.Sprintf("Promotion failed: %v", err))
+		return err
+	}
+	a.gateway.SendNotification(ctx, tenantID, fmt.Sprintf(
+		"✅ *Rule promoted.*\n\nFrom now on, when this case pattern matches I'll *%s* (instead of the workflow default).\n\nSkillVersion bumped to v%d, %d active rule(s) total.",
+		rule.RecommendedAction, sv.Version, len(sv.RuleManifest)))
+	return nil
+}
+
+func (a *App) dispatchInbound(ctx context.Context, tenantID string, binding domain.ChannelBinding, packetID string, msg channel.InboundMessage, action domain.ActionButton, freeText string) error {
+	if !action.Valid() || packetID == "" {
+		_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "correction_dead_lettered", "operator", binding.OperatorID, "message", msg.ProviderMessageID, nil, map[string]any{
+			"channel":   string(channel.ChannelWhatsApp),
+			"packet_id": packetID,
+			"free_text": msg.FreeText,
+			"sender":    msg.SenderIdentifier,
+			"action":    string(action),
+		}, "deadletter", tenantID, msg.ProviderMessageID))
+		return nil
+	}
+	_, err := a.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:             string(channel.ChannelWhatsApp),
+		ProviderNumber:      binding.ProviderNumber,
+		PacketID:            packetID,
+		SourceMessageID:     msg.ProviderMessageID,
+		RawInboundMessageID: string(channel.ChannelWhatsApp) + ":" + msg.ProviderMessageID,
+		ActionButton:        action,
+		FreeText:            freeText,
+		ReceivedAt:          msg.ReceivedAt,
+	})
+	return err
+}
+
+// intentResult captures the parsed intent of an operator's free-text reply.
+type intentResult struct {
+	kind string // "approve" | "reject_with_reason" | "reject_need_followup" | "correction" | "promote" | ""
+	note string // the operator's payload text (any after-yes / after-no commentary)
+}
+
+// classifyIntent reads natural-language replies into a yes/no/other shape.
+// Spec §7.1 stage-2 (text-match) parser, narrowed to the binary UX the
+// operator prefers (rather than the 6-button enum exposed by spec §3.1).
+func classifyIntent(text string) intentResult {
+	clean := strings.TrimSpace(text)
+	if clean == "" {
+		return intentResult{}
+	}
+	lower := strings.ToLower(clean)
+	// Operator command: "promote" (or "promote it", "promote please").
+	if lower == "promote" || strings.HasPrefix(lower, "promote ") {
+		return intentResult{kind: "promote"}
+	}
+	if rest, ok := stripPrefix(lower, clean, yesTokens); ok {
+		return intentResult{kind: "approve", note: cleanupNote(rest)}
+	}
+	if rest, ok := stripPrefix(lower, clean, noTokens); ok {
+		note := cleanupNote(rest)
+		if note == "" {
+			return intentResult{kind: "reject_need_followup"}
+		}
+		return intentResult{kind: "reject_with_reason", note: note}
+	}
+	// No yes/no marker — treat as a substantive correction.
+	return intentResult{kind: "correction", note: clean}
+}
+
+var (
+	yesTokens = []string{"yes", "yep", "yup", "y", "ok", "okay", "sure", "approve", "approved", "approve.", "lgtm", "looks good", "go ahead", "go", "send", "send it", "confirm", "confirmed", "do it", "1", "👍", "👌", "✅"}
+	noTokens  = []string{"no", "nope", "nah", "n", "wrong", "incorrect", "negative", "stop", "hold", "don't", "do not", "2", "👎", "❌"}
+)
+
+// stripPrefix returns (textAfterPrefix, true) if `lower` starts with one of
+// the tokens (whole-word match), else ("", false). The original `original`
+// text is sliced so casing is preserved in the returned remainder.
+func stripPrefix(lower, original string, tokens []string) (string, bool) {
+	for _, token := range tokens {
+		if !strings.HasPrefix(lower, token) {
+			continue
+		}
+		// Whole-word: token must be followed by end-of-string, space, or punctuation.
+		if len(lower) == len(token) {
+			return "", true
+		}
+		next := lower[len(token)]
+		if next == ' ' || next == ',' || next == '.' || next == '!' || next == '-' || next == ':' || next == ';' || next == '?' {
+			return original[len(token):], true
+		}
+	}
+	return "", false
+}
+
+func cleanupNote(s string) string {
+	clean := strings.TrimSpace(s)
+	clean = strings.TrimLeft(clean, ",.:;-! ")
+	return strings.TrimSpace(clean)
+}
+
+// NotifyChannelSession is the callback the WhatsApp Manager invokes on
+// session-state transitions; the gateway updates session_status and drains
+// the durable queue if appropriate.
+func (a *App) NotifyChannelSession(ctx context.Context, tenantID string, ch channel.Channel, status domain.SessionStatus) {
+	a.gateway.NotifySessionStatus(ctx, tenantID, ch, status)
+}
+
+func extractPacketReference(text string) string {
+	const tag = "[packet:"
+	i := strings.Index(text, tag)
+	if i < 0 {
+		return ""
+	}
+	rest := text[i+len(tag):]
+	end := strings.IndexByte(rest, ']')
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// guessButtonFromText derives an action_button from a free-text reply.
+// Real operators type natural language, not "wrong action ..." prefixes, so
+// we apply a two-stage decision:
+//   1. Numeric (1..6) or short positive ack ("approve" / "ok" / "yes" / "👍")
+//      → exact button match.
+//   2. Anything else (substantive prose) → ActionWrongAction with the prose
+//      preserved as free_text. structuredRuleFromCorrection then mines the
+//      content for known patterns (singapore/no gst, photos, send anyway, etc).
+//
+// This is the spec's Stage 2 (text-match) cascade per operator-ux §7.1.
+// Stage 3 (LLM-assisted) is deferred to Phase 2 per RESOLVED-OE-OU-2.
+func guessButtonFromText(text string) domain.ActionButton {
+	clean := strings.ToLower(strings.TrimSpace(text))
+	if clean == "" {
+		return ""
+	}
+	// Direct button selection: digit or exact-prefix label.
+	switch {
+	case clean == "1":
+		return domain.ActionApprove
+	case clean == "2":
+		return domain.ActionWrongFacts
+	case clean == "3":
+		return domain.ActionWrongAction
+	case clean == "4":
+		return domain.ActionMissingCondition
+	case clean == "5":
+		return domain.ActionUseDifferentTemplate
+	case clean == "6":
+		return domain.ActionAddNote
+	}
+	// Short positive acknowledgement → approve.
+	if isApprovalText(clean) {
+		return domain.ActionApprove
+	}
+	// Explicit button labels still respected when typed verbatim.
+	switch {
+	case strings.HasPrefix(clean, "wrong facts"):
+		return domain.ActionWrongFacts
+	case strings.HasPrefix(clean, "wrong action"):
+		return domain.ActionWrongAction
+	case strings.HasPrefix(clean, "missing"):
+		return domain.ActionMissingCondition
+	case strings.HasPrefix(clean, "use different"):
+		return domain.ActionUseDifferentTemplate
+	case strings.HasPrefix(clean, "add note"):
+		return domain.ActionAddNote
+	}
+	// Any other substantive text is treated as a correction. The actual
+	// semantic conversion (text → conditions + recommended_action) happens
+	// downstream in structuredRuleFromCorrection during the merge step.
+	return domain.ActionWrongAction
+}
+
+func isApprovalText(clean string) bool {
+	if len(clean) > 32 {
+		return false
+	}
+	switch clean {
+	case "approve", "approved", "ok", "okay", "yes", "y", "yep", "yup",
+		"sure", "looks good", "lgtm", "go", "go ahead", "send", "send it",
+		"confirm", "confirmed", "👍", "👌", "✅":
+		return true
+	}
+	return strings.HasPrefix(clean, "approve")
+}
+
 func (a *App) ListCandidates(ctx context.Context, tenantID string) ([]domain.RuleCandidate, error) {
 	return a.store.ListCandidates(ctx, tenantID)
 }
 
 func (a *App) PromoteCandidate(ctx context.Context, tenantID, candidateID, reviewerID, rationale string) (domain.ValidatedRule, domain.SkillVersion, error) {
-	if reviewerID == "" {
+	if tenantID == "" || candidateID == "" || reviewerID == "" {
 		return domain.ValidatedRule{}, domain.SkillVersion{}, domain.ErrInvalidInput
 	}
 	candidate, err := a.store.GetCandidate(ctx, tenantID, candidateID)
@@ -360,14 +668,6 @@ func (a *App) BuildVerticalAggregates(ctx context.Context, vertical, workflowSlu
 
 func (a *App) CallMCPWriteFinal(ctx context.Context, boundTenantID string, serverMode domain.Mode, req domain.MCPRequest) (domain.MCPResult, error) {
 	now := a.clock.Now()
-	if req.TenantHeader != boundTenantID {
-		_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, boundTenantID, "security_violation", "system", "mcp", "decision_point", req.DecisionPointID, nil, map[string]any{
-			"tenant_header": req.TenantHeader,
-			"bound_tenant":  boundTenantID,
-			"tool_name":     req.ToolName,
-		}, "mcp-security", boundTenantID, req.CaseRunID, req.DecisionPointID, req.ToolName))
-		return domain.MCPResult{OK: false, Code: "TENANT_MISMATCH", Error: domain.ErrSecurityViolation.Error()}, domain.ErrSecurityViolation
-	}
 	effectiveServerMode := domain.ParseMode(string(serverMode))
 	effectiveRequestMode := domain.ParseMode(string(req.Mode))
 	if effectiveServerMode == domain.ModeSandbox || effectiveRequestMode == domain.ModeSandbox {
@@ -375,6 +675,14 @@ func (a *App) CallMCPWriteFinal(ctx context.Context, boundTenantID string, serve
 			"tool_name": req.ToolName,
 		}, "mcp-sandbox", boundTenantID, req.CaseRunID, req.DecisionPointID, req.ToolName))
 		return domain.MCPResult{OK: false, Code: "SANDBOX_MODE", Error: domain.ErrSandboxMode.Error()}, domain.ErrSandboxMode
+	}
+	if req.TenantHeader != boundTenantID {
+		_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, boundTenantID, "security_violation", "system", "mcp", "decision_point", req.DecisionPointID, nil, map[string]any{
+			"tenant_header": req.TenantHeader,
+			"bound_tenant":  boundTenantID,
+			"tool_name":     req.ToolName,
+		}, "mcp-security", boundTenantID, req.CaseRunID, req.DecisionPointID, req.ToolName))
+		return domain.MCPResult{OK: false, Code: "TENANT_MISMATCH", Error: domain.ErrSecurityViolation.Error()}, domain.ErrSecurityViolation
 	}
 	ok, err := a.store.HasApprovalAudit(ctx, boundTenantID, req.CaseRunID, req.DecisionPointID)
 	if err != nil {
@@ -424,13 +732,17 @@ func (a *App) persistSignal(ctx context.Context, envelope domain.ApprovalSignalE
 
 func (a *App) persistApproval(ctx context.Context, envelope domain.ApprovalSignalEnvelope) error {
 	now := a.clock.Now()
+	approvalPayload := map[string]any{
+		"action_button": string(envelope.ActionButton),
+		"channel":       envelope.Channel,
+	}
+	if note := strings.TrimSpace(envelope.FreeText); note != "" {
+		approvalPayload["operator_note"] = note
+	}
 	_, err := a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, envelope.TenantID, "approval_received", "operator", envelope.OperatorID, "decision_point", envelope.DecisionPointID, map[string]any{
 		"case_run_id": envelope.CaseRunID,
 		"packet_id":   envelope.PacketID,
-	}, map[string]any{
-		"action_button": string(envelope.ActionButton),
-		"channel":       envelope.Channel,
-	}, "approval", envelope.TenantID, envelope.CaseRunID, envelope.DecisionPointID, string(envelope.ActionButton)))
+	}, approvalPayload, "approval", envelope.TenantID, envelope.CaseRunID, envelope.DecisionPointID, string(envelope.ActionButton)))
 	if err != nil {
 		return err
 	}
@@ -507,16 +819,38 @@ func (a *App) mergeCandidate(ctx context.Context, correction domain.Correction) 
 	}
 	now := a.clock.Now()
 	workflowSlug := workflowFromCaseInput(point.AgentInput)
-	candidate, err := a.store.FindCandidate(ctx, correction.TenantID, workflowSlug, point.DecisionType, conditionsHash, recommendedAction)
-	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+	siblings, err := a.store.ListCandidatesByConditions(ctx, correction.TenantID, workflowSlug, point.DecisionType, conditionsHash)
+	if err != nil {
 		return err
 	}
-	if errors.Is(err, domain.ErrNotFound) {
+	var match domain.RuleCandidate
+	var contradicting []domain.RuleCandidate
+	for _, sibling := range siblings {
+		if sibling.RecommendedAction == recommendedAction {
+			match = sibling
+		} else {
+			contradicting = append(contradicting, sibling)
+		}
+	}
+	if match.ID == "" {
+		for _, conflict := range contradicting {
+			conflict.ContradictingCount++
+			conflict.Confidence = domain.CandidateConfidence(now, conflict.EvidenceCount, conflict.ContradictingCount, conflict.SourceCaseRunIDs, []string{conflict.TenantID}, conflict.LastSeenAt)
+			conflict.Status = domain.CandidateStatus(conflict.Confidence, conflict.EvidenceCount, conflict.ContradictingCount)
+			if err := a.store.SaveCandidate(ctx, conflict); err != nil {
+				return err
+			}
+			_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, correction.TenantID, "candidate_contradiction_detected", "system", "learning", "rule_candidate", conflict.ID, map[string]any{
+				"correction_id":     correction.ID,
+				"conflicting_action": recommendedAction,
+			}, nil, "candidate-contradiction", correction.TenantID, conflict.ID, correction.ID))
+			a.gateway.SendNotification(ctx, correction.TenantID, formatContradictionAlert(conflict, recommendedAction))
+		}
 		scope := domain.ScopeCase
 		if correction.ScopeHint != nil {
 			scope = *correction.ScopeHint
 		}
-		candidate = domain.RuleCandidate{
+		candidate := domain.RuleCandidate{
 			ID:                  a.ids.NewID("rc"),
 			TenantID:            correction.TenantID,
 			WorkflowSlug:        workflowSlug,
@@ -543,28 +877,70 @@ func (a *App) mergeCandidate(ctx context.Context, correction domain.Correction) 
 		_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, correction.TenantID, "candidate_created", "system", "learning", "rule_candidate", candidate.ID, map[string]any{
 			"correction_id": correction.ID,
 		}, nil, "candidate-created", correction.TenantID, candidate.ID))
+		a.gateway.SendNotification(ctx, correction.TenantID, formatLearningStatus(candidate, "first"))
 		return err
 	}
-	if contains(candidate.SourceCorrectionIDs, correction.ID) {
+	if contains(match.SourceCorrectionIDs, correction.ID) {
 		return nil
 	}
-	candidate.SourceCorrectionIDs = append(candidate.SourceCorrectionIDs, correction.ID)
-	candidate.SourceCaseRunIDs = appendIfMissing(candidate.SourceCaseRunIDs, correction.CaseRunID)
-	candidate.EvidenceCount++
-	candidate.LastSeenAt = now
-	candidate.Confidence = domain.CandidateConfidence(now, candidate.EvidenceCount, candidate.ContradictingCount, candidate.SourceCaseRunIDs, []string{candidate.TenantID}, candidate.LastSeenAt)
-	nextStatus := domain.CandidateStatus(candidate.Confidence, candidate.EvidenceCount, candidate.ContradictingCount)
-	if candidate.Status != "under_review" && nextStatus == "under_review" {
-		candidate.UnderReviewAt = &now
+	match.SourceCorrectionIDs = append(match.SourceCorrectionIDs, correction.ID)
+	match.SourceCaseRunIDs = appendIfMissing(match.SourceCaseRunIDs, correction.CaseRunID)
+	match.EvidenceCount++
+	match.LastSeenAt = now
+	match.Confidence = domain.CandidateConfidence(now, match.EvidenceCount, match.ContradictingCount, match.SourceCaseRunIDs, []string{match.TenantID}, match.LastSeenAt)
+	nextStatus := domain.CandidateStatus(match.Confidence, match.EvidenceCount, match.ContradictingCount)
+	if match.Status != "under_review" && nextStatus == "under_review" {
+		match.UnderReviewAt = &now
 	}
-	candidate.Status = nextStatus
-	if err := a.store.SaveCandidate(ctx, candidate); err != nil {
+	match.Status = nextStatus
+	if err := a.store.SaveCandidate(ctx, match); err != nil {
 		return err
 	}
-	_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, correction.TenantID, "candidate_evidence_added", "system", "learning", "rule_candidate", candidate.ID, map[string]any{
+	_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, correction.TenantID, "candidate_evidence_added", "system", "learning", "rule_candidate", match.ID, map[string]any{
 		"correction_id": correction.ID,
-	}, nil, "candidate-evidence", correction.TenantID, candidate.ID, correction.ID))
+	}, nil, "candidate-evidence", correction.TenantID, match.ID, correction.ID))
+	a.gateway.SendNotification(ctx, correction.TenantID, formatLearningStatus(match, "evidence"))
 	return err
+}
+
+// formatContradictionAlert is the operator-visible message Victoria sends
+// when a new correction contradicts an earlier one for the same conditions.
+// Goal: catch operator inconsistency before it becomes a permanent rule.
+func formatContradictionAlert(prior domain.RuleCandidate, newAction string) string {
+	priorStatus := "we'd been agreeing on"
+	if prior.Status == "under_review" {
+		priorStatus = "I'd flagged for promotion"
+	}
+	return fmt.Sprintf(
+		"⚠️ *Conflict detected.*\n\nFor this same case pattern %s *%s* (%d matching corrections so far). Your latest reply tells me to do *%s* instead.\n\nI won't promote either rule until this is resolved. Reply with which one is right, or escalate to a senior reviewer.",
+		priorStatus, prior.RecommendedAction, prior.EvidenceCount, newAction)
+}
+
+// formatLearningStatus narrates Victoria's internal learning state back to
+// the operator after a correction is merged. Goal: every correction visibly
+// changes something the operator can see.
+func formatLearningStatus(candidate domain.RuleCandidate, kind string) string {
+	switch candidate.Status {
+	case "under_review":
+		return fmt.Sprintf(
+			"🔔 That's *%d corrections* matching this same case pattern.\n\nI'm flagging a new rule for your review:\n  → %s\n\nReply *promote* (or run /admin/candidates/%s/%s/promote) when ready, and I'll apply it from here on.",
+			candidate.EvidenceCount, candidate.RecommendedAction, candidate.TenantID, candidate.ID)
+	default:
+		// Build a remaining-evidence countdown. We use 3 as the threshold
+		// (DefaultMinEvidenceCount) so the operator sees concrete progress.
+		remaining := domain.DefaultMinEvidenceCount - candidate.EvidenceCount
+		if remaining <= 0 {
+			remaining = 1
+		}
+		switch kind {
+		case "first":
+			return fmt.Sprintf("✅ Got it — recorded your correction. (%d of %d matches before I propose a rule.)",
+				candidate.EvidenceCount, domain.DefaultMinEvidenceCount)
+		default:
+			return fmt.Sprintf("✅ Got it. (%d of %d matches — %d more to go.)",
+				candidate.EvidenceCount, domain.DefaultMinEvidenceCount, remaining)
+		}
+	}
 }
 
 func (a *App) createSkillVersion(ctx context.Context, tenantID, workflowSlug string, now time.Time) (domain.SkillVersion, error) {

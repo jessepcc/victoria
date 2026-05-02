@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"victoria/internal/channel"
 	"victoria/internal/domain"
 	"victoria/internal/store/memory"
 )
@@ -406,6 +407,389 @@ func TestPromotionSupersedesSameConditionRule(t *testing.T) {
 	}
 	if second.Supersedes != first.ID || second.Version != first.Version+1 {
 		t.Fatalf("supersession got supersedes=%s version=%d, want %s/%d", second.Supersedes, second.Version, first.ID, first.Version+1)
+	}
+}
+
+func TestMCPGateOrderSandboxFiresFirst(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	run, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeLive,
+		Payload:      quotePayload("gate-order"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := domain.MCPRequest{
+		TenantHeader:    "t_other",
+		CaseRunID:       run.ID,
+		DecisionPointID: run.DecisionPointID,
+		Mode:            domain.ModeLive,
+		ToolName:        "send_draft_email",
+	}
+	if _, err := application.CallMCPWriteFinal(ctx, tenant.ID, domain.ModeSandbox, req); !errors.Is(err, domain.ErrSandboxMode) {
+		t.Fatalf("sandbox + tenant mismatch err = %v, want sandbox mode (Gate 1 fires first)", err)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "sandbox_escape_blocked") == 0 {
+		t.Fatal("expected sandbox_escape_blocked audit event")
+	}
+	if countEvents(events, "security_violation") != 0 {
+		t.Fatal("Gate 3 fired before Gate 1; got security_violation audit when sandbox should have blocked first")
+	}
+}
+
+func TestContradictingCorrectionFlagsExistingCandidate(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	rejectCase(t, application, tenant, "one", "msg_1")
+	rejectCase(t, application, tenant, "two", "msg_2")
+
+	_, packet, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("contradiction"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:         "telegram",
+		ProviderNumber:  "+61400000000",
+		PacketID:        packet.PacketID,
+		SourceMessageID: "contra_msg",
+		ActionButton:    domain.ActionWrongAction,
+		FreeText:        "Go ahead, send it anyway when photos are incomplete.",
+		FollowUpAnswer:  "always for this client type",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	candidates, err := application.ListCandidates(ctx, tenant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var holdCandidate domain.RuleCandidate
+	var sendCandidate domain.RuleCandidate
+	for _, candidate := range candidates {
+		switch candidate.RecommendedAction {
+		case "hold_and_request_more_info":
+			holdCandidate = candidate
+		case "send_quote":
+			sendCandidate = candidate
+		}
+	}
+	if holdCandidate.ID == "" || sendCandidate.ID == "" {
+		t.Fatalf("expected both candidates; got %+v", candidates)
+	}
+	if holdCandidate.ConditionsHash != sendCandidate.ConditionsHash {
+		t.Fatalf("conditions_hash differ: %s vs %s", holdCandidate.ConditionsHash, sendCandidate.ConditionsHash)
+	}
+	if holdCandidate.ContradictingCount != 1 {
+		t.Fatalf("hold candidate ContradictingCount = %d, want 1", holdCandidate.ContradictingCount)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "candidate_contradiction_detected") != 1 {
+		t.Fatalf("candidate_contradiction_detected count = %d, want 1", countEvents(events, "candidate_contradiction_detected"))
+	}
+}
+
+func TestReplayPreservesOriginalMode(t *testing.T) {
+	ctx := context.Background()
+	application, _, _, tenant := newTestApp(t)
+	original, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeLive,
+		Payload:      quotePayload("live"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := application.ReplayCase(ctx, ReplayInput{TenantID: tenant.ID, CaseRunID: original.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.Mode != domain.ModeLive {
+		t.Fatalf("replay mode = %s, want %s (INV-CR3 immutable mode)", replay.Mode, domain.ModeLive)
+	}
+}
+
+func TestReplayUsesMCPReadSnapshot(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	original, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("snapshot"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := store.ListArtifacts(ctx, tenant.ID, original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshotID string
+	for _, artifact := range artifacts {
+		if artifact.ArtifactType == "mcp_read_snapshot" {
+			snapshotID = artifact.ID
+			break
+		}
+	}
+	if snapshotID == "" {
+		t.Fatal("mcp_read_snapshot artifact not created on StartCase")
+	}
+	mutated := domain.Artifact{
+		ID:              snapshotID,
+		TenantID:        tenant.ID,
+		CaseRunID:       original.ID,
+		DecisionPointID: original.DecisionPointID,
+		ArtifactType:    "mcp_read_snapshot",
+		StoragePath:     "/mutated",
+		Content: map[string]any{
+			"sandbox":         true,
+			"client_type":     "repeat",
+			"photos_complete": true,
+			"snapshot_marker": "frozen",
+		},
+		CreatedAt: original.CreatedAt,
+	}
+	if err := store.CreateArtifact(ctx, mutated); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := application.ReplayCase(ctx, ReplayInput{TenantID: tenant.ID, CaseRunID: original.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.InputPayload["snapshot_marker"] != "frozen" {
+		t.Fatalf("replay input payload not loaded from snapshot artifact; got %+v", replay.InputPayload)
+	}
+}
+
+func TestQueuedPacketNotMarkedDeliveredDuringOutage(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	application.DisconnectGateway(ctx, tenant.ID)
+	_, packet, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("queued"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.GetReviewPacket(ctx, tenant.ID, packet.PacketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Delivered {
+		t.Fatal("packet stored as delivered while session disconnected")
+	}
+	drained := application.RecoverGateway(ctx, tenant.ID)
+	if len(drained) != 1 {
+		t.Fatalf("drained len = %d, want 1", len(drained))
+	}
+	stored, err = store.GetReviewPacket(ctx, tenant.ID, packet.PacketID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Delivered {
+		t.Fatal("packet not marked delivered after recover")
+	}
+}
+
+// fakeWAAdapter is a stand-in for the whatsmeow Manager used to test the
+// gateway's adapter-aware send + queue + drain path without touching the
+// network.
+type fakeWAAdapter struct {
+	sentPacketIDs []string
+	failNext      bool
+}
+
+func (*fakeWAAdapter) Channel() channel.Channel { return channel.ChannelWhatsApp }
+func (a *fakeWAAdapter) SendOutbound(_ context.Context, msg channel.OutboundMessage) (channel.DeliveryReceipt, error) {
+	if a.failNext {
+		a.failNext = false
+		return channel.DeliveryReceipt{}, fmt.Errorf("simulated send failure")
+	}
+	a.sentPacketIDs = append(a.sentPacketIDs, msg.PacketID)
+	return channel.DeliveryReceipt{ProviderMessageID: "wa:" + msg.PacketID, SentAt: time.Now()}, nil
+}
+func (*fakeWAAdapter) NormalizeInboundWebhook([]byte) ([]channel.InboundMessage, error) {
+	return nil, nil
+}
+
+func TestWhatsAppOutageQueuesDurablyAndDrainsOnReconnect(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{}
+	application.RegisterChannelAdapter(wa)
+
+	// Mark WhatsApp session active so packets prefer it.
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+	if _, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("wa-online"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sentPacketIDs) != 1 {
+		t.Fatalf("expected 1 packet sent while active, got %d", len(wa.sentPacketIDs))
+	}
+
+	// Now simulate disconnect; subsequent packets must be persisted, not sent.
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionDisconnected)
+	for i := 0; i < 3; i++ {
+		if _, _, err := application.StartCase(ctx, StartCaseInput{
+			TenantID:     tenant.ID,
+			WorkflowSlug: "quote_drafting",
+			Mode:         domain.ModeSandbox,
+			Payload:      quotePayload(fmt.Sprintf("wa-down-%d", i)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(wa.sentPacketIDs) != 1 {
+		t.Fatalf("packets sent during outage: got %d, want 1 (only pre-outage)", len(wa.sentPacketIDs))
+	}
+	depth, err := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if depth != 3 {
+		t.Fatalf("queue depth = %d, want 3", depth)
+	}
+
+	// Reconnect: gateway must drain in FIFO order.
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+	if len(wa.sentPacketIDs) != 4 {
+		t.Fatalf("after drain, sent count = %d, want 4", len(wa.sentPacketIDs))
+	}
+	depthAfter, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if depthAfter != 0 {
+		t.Fatalf("queue depth after drain = %d, want 0", depthAfter)
+	}
+}
+
+func TestWhatsAppDrainPreservesQueueOnSendFailure(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{}
+	application.RegisterChannelAdapter(wa)
+
+	// Queue 2 packets while disconnected.
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionDisconnected)
+	for i := 0; i < 2; i++ {
+		if _, _, err := application.StartCase(ctx, StartCaseInput{
+			TenantID:     tenant.ID,
+			WorkflowSlug: "quote_drafting",
+			Mode:         domain.ModeSandbox,
+			Payload:      quotePayload(fmt.Sprintf("preq-%d", i)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if depth, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp)); depth != 2 {
+		t.Fatalf("queue depth before drain = %d, want 2", depth)
+	}
+
+	// Arm the adapter to fail on the very first drain attempt.
+	wa.failNext = true
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+
+	// After a failed drain attempt, all entries must remain so the next
+	// reconnect can retry. WA-INV-3: no silent loss.
+	depth, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if depth != 2 {
+		t.Fatalf("queue depth after failed drain = %d, want 2 (no silent loss)", depth)
+	}
+	if len(wa.sentPacketIDs) != 0 {
+		t.Fatalf("packets reported sent on failed drain: %d", len(wa.sentPacketIDs))
+	}
+
+	// Trigger another reconnect; this time the adapter accepts both packets.
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionDisconnected)
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+	if len(wa.sentPacketIDs) != 2 {
+		t.Fatalf("after retry drain, sent = %d, want 2", len(wa.sentPacketIDs))
+	}
+	finalDepth, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if finalDepth != 0 {
+		t.Fatalf("queue depth after successful drain = %d, want 0", finalDepth)
+	}
+}
+
+func TestWhatsAppQueueOverflowTombstonesOldest(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	application.RegisterChannelAdapter(&fakeWAAdapter{})
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionDisconnected)
+
+	for i := 0; i < OutboundQueueMax+5; i++ {
+		if _, _, err := application.StartCase(ctx, StartCaseInput{
+			TenantID:     tenant.ID,
+			WorkflowSlug: "quote_drafting",
+			Mode:         domain.ModeSandbox,
+			Payload:      quotePayload(fmt.Sprintf("flood-%d", i)),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	depth, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if depth != OutboundQueueMax {
+		t.Fatalf("queue depth = %d, want capped at %d", depth, OutboundQueueMax)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "packet_tombstoned") < 5 {
+		t.Fatalf("packet_tombstoned count = %d, want >=5", countEvents(events, "packet_tombstoned"))
+	}
+}
+
+func TestExtractPacketReferenceParsesTag(t *testing.T) {
+	cases := map[string]string{
+		"approve\n[packet:pkt_abc]":    "pkt_abc",
+		"hello world":                  "",
+		"prefix [packet:pkt_xyz] tail": "pkt_xyz",
+	}
+	for in, want := range cases {
+		if got := extractPacketReference(in); got != want {
+			t.Fatalf("extractPacketReference(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestGuessButtonFromTextHandlesNumberAndLabel(t *testing.T) {
+	cases := map[string]domain.ActionButton{
+		// Direct numeric/label paths.
+		"1":              domain.ActionApprove,
+		"approve please": domain.ActionApprove,
+		"3":              domain.ActionWrongAction,
+		"add note: hi":   domain.ActionAddNote,
+		// Short positive acknowledgements → approve.
+		"ok":         domain.ActionApprove,
+		"yes":        domain.ActionApprove,
+		"looks good": domain.ActionApprove,
+		"👍":          domain.ActionApprove,
+		// Substantive prose without a recognised approval token →
+		// wrong_action; structured parser downstream extracts the rule.
+		"no, this is from singapore": domain.ActionWrongAction,
+		"send it anyway":             domain.ActionWrongAction,
+		"???":                        domain.ActionWrongAction,
+		// Empty stays empty (would be dead-lettered upstream anyway).
+		"": "",
+	}
+	for in, want := range cases {
+		if got := guessButtonFromText(in); got != want {
+			t.Fatalf("guessButtonFromText(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

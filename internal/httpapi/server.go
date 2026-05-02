@@ -1,23 +1,37 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"victoria/internal/app"
+	"victoria/internal/channel"
 	"victoria/internal/domain"
 )
 
-type Server struct {
-	app *app.App
+// WhatsAppManager is the subset of channel/whatsapp.Manager that the HTTP
+// layer needs. Defined here to keep the http package free of a hard whatsmeow
+// dependency in tests.
+type WhatsAppManager interface {
+	BeginPairing(ctx context.Context, tenantID string) (string, error)
+	CurrentQR(tenantID string) string
+	Status(tenantID string) domain.SessionStatus
+	Logout(ctx context.Context, tenantID string) error
 }
 
-func New(application *app.App) *Server {
-	return &Server{app: application}
+type Server struct {
+	app      *app.App
+	whatsapp WhatsAppManager
+}
+
+func New(application *app.App, wa WhatsAppManager) *Server {
+	return &Server{app: application, whatsapp: wa}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -31,8 +45,110 @@ func (s *Server) Handler() http.Handler {
 	r.With(tenantAuth).Get("/candidates", s.listCandidates)
 	r.Post("/gateway/inbound", s.gatewayInbound)
 	r.Get("/mcp/tools", s.mcpTools)
-	r.Post("/mcp/write-final", s.mcpWriteFinal)
+	r.With(tenantAuth).Post("/mcp/write-final", s.mcpWriteFinal)
+	r.With(tenantAuth).Post("/channel-bindings/whatsapp/init", s.whatsappInit)
+	r.With(tenantAuth).Get("/channel-bindings/whatsapp/qr", s.whatsappQR)
+	r.With(tenantAuth).Get("/channel-bindings/whatsapp/qr.png", s.whatsappQRPNG)
+	r.With(tenantAuth).Get("/channel-bindings/whatsapp/status", s.whatsappStatus)
+	r.With(tenantAuth).Delete("/channel-bindings/whatsapp", s.whatsappLogout)
 	return r
+}
+
+func (s *Server) whatsappInit(w http.ResponseWriter, r *http.Request) {
+	if s.whatsapp == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "whatsapp_disabled"})
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	binding, err := s.bindingForTenant(r.Context(), tenantID, channel.ChannelWhatsApp)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	code, err := s.whatsapp.BeginPairing(r.Context(), tenantID)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "pairing_failed", "message": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"qr":              code,
+		"status":          string(s.whatsapp.Status(tenantID)),
+		"provider_number": binding.ProviderNumber,
+		"png_url":         "/channel-bindings/whatsapp/qr.png",
+	})
+}
+
+func (s *Server) whatsappQR(w http.ResponseWriter, r *http.Request) {
+	if s.whatsapp == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "whatsapp_disabled"})
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	code := s.whatsapp.CurrentQR(tenantID)
+	if code == "" {
+		writeJSON(w, http.StatusGone, map[string]any{"error": "no_active_qr", "status": string(s.whatsapp.Status(tenantID))})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"qr": code, "status": string(s.whatsapp.Status(tenantID))})
+}
+
+func (s *Server) whatsappQRPNG(w http.ResponseWriter, r *http.Request) {
+	if s.whatsapp == nil {
+		http.Error(w, "whatsapp_disabled", http.StatusServiceUnavailable)
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	code := s.whatsapp.CurrentQR(tenantID)
+	if code == "" {
+		http.Error(w, "no_active_qr", http.StatusGone)
+		return
+	}
+	png, err := qrcode.Encode(code, qrcode.Medium, 320)
+	if err != nil {
+		http.Error(w, "qr_encode_failed", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(png)
+}
+
+func (s *Server) whatsappStatus(w http.ResponseWriter, r *http.Request) {
+	tenantID := tenantFromContext(r.Context())
+	binding, err := s.bindingForTenant(r.Context(), tenantID, channel.ChannelWhatsApp)
+	if err != nil && !errors.Is(err, domain.ErrNotFound) {
+		writeError(w, err)
+		return
+	}
+	status := domain.SessionUnknown
+	if s.whatsapp != nil {
+		status = s.whatsapp.Status(tenantID)
+	}
+	if status == domain.SessionUnknown && binding.SessionStatus != "" {
+		status = binding.SessionStatus
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":          string(status),
+		"provider_number": binding.ProviderNumber,
+		"updated_at":      binding.SessionUpdated,
+	})
+}
+
+func (s *Server) whatsappLogout(w http.ResponseWriter, r *http.Request) {
+	if s.whatsapp == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "whatsapp_disabled"})
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	if err := s.whatsapp.Logout(r.Context(), tenantID); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) bindingForTenant(ctx context.Context, tenantID string, ch channel.Channel) (domain.ChannelBinding, error) {
+	return s.app.GetChannelBinding(ctx, tenantID, string(ch))
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -149,14 +265,14 @@ func (s *Server) mcpTools(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) mcpWriteFinal(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		BoundTenantID string            `json:"bound_tenant_id"`
-		ServerMode    string            `json:"server_mode"`
-		Request       domain.MCPRequest `json:"request"`
+		ServerMode string            `json:"server_mode"`
+		Request    domain.MCPRequest `json:"request"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	result, err := s.app.CallMCPWriteFinal(r.Context(), req.BoundTenantID, domain.Mode(req.ServerMode), req.Request)
+	boundTenantID := tenantFromContext(r.Context())
+	result, err := s.app.CallMCPWriteFinal(r.Context(), boundTenantID, domain.Mode(req.ServerMode), req.Request)
 	if err != nil {
 		writeErrorWithPayload(w, err, result)
 		return

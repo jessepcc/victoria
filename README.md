@@ -2,6 +2,14 @@
 
 Victoria is a sandbox correction engine for chat-native workflow automation. This implementation follows `doc/sandbox-tech-spec` as a production-oriented MVP slice: tenant provisioning, sandbox workflow execution, review packets, gateway reply parsing, correction persistence, rule candidates, human promotion, skill-version pinning, replay, audit events, and MCP write gates.
 
+## Documentation
+
+| Doc | Audience | Purpose |
+|---|---|---|
+| [doc/sandbox-tech-spec/](doc/sandbox-tech-spec/) | Architects | Round-5-signed-off base architecture (5 specs, 9k lines) |
+| [doc/customer-inbound-spec.md](doc/customer-inbound-spec.md) | R&D team | **Beta launch spec** for customer-inbound channels (00 email/Telegram, A0 read-only WhatsApp, A1 dedicated-number WhatsApp). Acceptance criteria + phased rollout. |
+| [doc/whatsapp-setup.md](doc/whatsapp-setup.md) | Operators | Runbook for pairing a WhatsApp number to a tenant via QR |
+
 ## Run
 
 In-memory mode:
@@ -40,5 +48,26 @@ VICTORIA_TEST_DATABASE_URL='postgres://user:pass@localhost:5432/victoria_test?ss
 - `POST /admin/replays` replays a case with pinned or current skill version.
 - `GET /mcp/tools?mode=sandbox|live` returns the effective MCP tool manifest.
 - `POST /mcp/write-final` exercises the MCP three-gate preflight: tenant binding, sandbox mode, approval audit.
+- `POST /channel-bindings/whatsapp/init` starts a fresh whatsmeow pairing for the authenticated tenant; `GET /channel-bindings/whatsapp/qr.png` returns a renderable QR. See [doc/whatsapp-setup.md](doc/whatsapp-setup.md).
 
-This code intentionally uses local adapters for Hermes, Temporal, WhatsApp, and MCP sidecars. The contracts are isolated behind application boundaries so production integrations can replace those adapters without changing the correction-loop behavior.
+The Hermes, Temporal, and MCP sidecars are still local adapters. WhatsApp is now a real adapter built on `go.mau.fi/whatsmeow` (operator-ux spec §4.1–4.7) — bring it up by setting `VICTORIA_DATABASE_URL` and following the runbook in [doc/whatsapp-setup.md](doc/whatsapp-setup.md). To skip whatsmeow entirely (e.g., when running CI without Postgres), set `VICTORIA_WHATSAPP_DISABLED=1`.
+
+## Beta scope (in build)
+
+Customer-inbound channels — see [doc/customer-inbound-spec.md](doc/customer-inbound-spec.md) for full implementation spec, acceptance criteria, and phased rollout (P0 → P10):
+
+| Tier | What it is | Pricing position |
+|---|---|---|
+| **00** | Customer enquiries ingested from email + Telegram → become `CaseRun`s | Floor requirement for both A0 and A1 |
+| **A0** | Read-only Victoria on the operator's existing WA number. Drafts replies; operator forwards manually. | Lower tier — back-office assistant |
+| **A1-whatsmeow** | Dedicated WA number (Victoria-supplied as part of the plan); Victoria handles inbound + outbound to customers end-to-end. | Premium tier — front-line agent |
+
+A1-BSP (WhatsApp Business API) is post-funding scope.
+
+## Demo / showcase scripts
+
+Three end-to-end storyline scripts under `scripts/` (run after pairing a tenant via `whatsapp-pair.sh`):
+
+- `showcase-1-teach-by-example.sh` — operator teaches Victoria a new business rule in 5 WhatsApp messages
+- `showcase-2-rules-generalize.sh` — three Singapore corrections produce a rule that also handles US suppliers correctly
+- `showcase-3-conflict-detection.sh` — Victoria detects contradicting operator corrections and surfaces them for senior review

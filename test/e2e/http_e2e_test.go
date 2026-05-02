@@ -16,7 +16,7 @@ import (
 
 func TestHTTPGoldenCorrectionLoop(t *testing.T) {
 	application := app.New(memory.New())
-	server := httptest.NewServer(httpapi.New(application).Handler())
+	server := httptest.NewServer(httpapi.New(application, nil).Handler())
 	t.Cleanup(server.Close)
 
 	var provision struct {
@@ -115,7 +115,7 @@ func TestHTTPGoldenCorrectionLoop(t *testing.T) {
 
 func TestHTTPTenantContextComesFromAuthToken(t *testing.T) {
 	application := app.New(memory.New())
-	server := httptest.NewServer(httpapi.New(application).Handler())
+	server := httptest.NewServer(httpapi.New(application, nil).Handler())
 	t.Cleanup(server.Close)
 
 	var tenantA struct {
@@ -176,6 +176,53 @@ func TestHTTPTenantContextComesFromAuthToken(t *testing.T) {
 
 	get(t, server.URL+"/candidates", "", nil, http.StatusUnauthorized)
 	get(t, server.URL+"/skill-versions/active?workflow_slug=quote_drafting", tenantB.Tenant.ID, nil, http.StatusOK)
+}
+
+func TestHTTPMCPWriteFinalBoundTenantFromAuth(t *testing.T) {
+	application := app.New(memory.New())
+	server := httptest.NewServer(httpapi.New(application, nil).Handler())
+	t.Cleanup(server.Close)
+
+	var tenantA struct {
+		Tenant domain.Tenant `json:"tenant"`
+	}
+	post(t, server.URL+"/admin/tenants", "", map[string]any{
+		"name":            "Tenant A",
+		"vertical":        "roofing",
+		"provider_number": "+61400000000",
+		"operator_id":     "op_telegram:a",
+	}, &tenantA, http.StatusCreated)
+	var tenantB struct {
+		Tenant domain.Tenant `json:"tenant"`
+	}
+	post(t, server.URL+"/admin/tenants", "", map[string]any{
+		"name":            "Tenant B",
+		"vertical":        "roofing",
+		"provider_number": "+61400000001",
+		"operator_id":     "op_telegram:b",
+	}, &tenantB, http.StatusCreated)
+
+	post(t, server.URL+"/mcp/write-final", "", map[string]any{
+		"server_mode": "live",
+		"request": map[string]any{
+			"tenant_header":     tenantA.Tenant.ID,
+			"case_run_id":       "cr_x",
+			"decision_point_id": "dp_x",
+			"mode":              "live",
+			"tool_name":         "send_draft_email",
+		},
+	}, nil, http.StatusUnauthorized)
+
+	post(t, server.URL+"/mcp/write-final", tenantA.Tenant.ID, map[string]any{
+		"server_mode": "live",
+		"request": map[string]any{
+			"tenant_header":     tenantB.Tenant.ID,
+			"case_run_id":       "cr_x",
+			"decision_point_id": "dp_x",
+			"mode":              "live",
+			"tool_name":         "send_draft_email",
+		},
+	}, nil, http.StatusForbidden)
 }
 
 func post(t *testing.T, url string, tenantID string, body any, out any, wantStatus int) {

@@ -284,10 +284,40 @@ type AuditEvent struct {
 }
 
 type ChannelBinding struct {
-	TenantID       string `json:"tenant_id"`
-	Channel        string `json:"channel"`
-	ProviderNumber string `json:"provider_number"`
-	OperatorID     string `json:"operator_id"`
+	TenantID       string        `json:"tenant_id"`
+	Channel        string        `json:"channel"`
+	ProviderNumber string        `json:"provider_number"`
+	OperatorID     string        `json:"operator_id"`
+	SessionStatus  SessionStatus `json:"session_status"`
+	SessionUpdated time.Time     `json:"session_updated_at"`
+}
+
+// SessionStatus tracks the WhatsApp/Telegram session lifecycle per
+// operator-ux §4.7.1 state machine.
+type SessionStatus string
+
+const (
+	SessionUnknown      SessionStatus = ""
+	SessionQRNeeded     SessionStatus = "qr_needed"
+	SessionConnecting   SessionStatus = "connecting"
+	SessionActive       SessionStatus = "active"
+	SessionDisconnected SessionStatus = "disconnected"
+	SessionSuspended    SessionStatus = "suspended"
+)
+
+func (s SessionStatus) IsConnected() bool {
+	return s == SessionActive
+}
+
+// OutboundQueueEntry is a packet awaiting delivery while the session is
+// not Active. Persisted across process restarts (operator-ux §4.7.4 / WA-INV-3).
+type OutboundQueueEntry struct {
+	ID             string    `json:"id"`
+	TenantID       string    `json:"tenant_id"`
+	Channel        string    `json:"channel"`
+	PacketID       string    `json:"packet_id"`
+	IdempotencyKey string    `json:"idempotency_key"`
+	EnqueuedAt     time.Time `json:"enqueued_at"`
 }
 
 type MCPRequest struct {

@@ -16,6 +16,15 @@ type Store interface {
 
 	UpsertChannelBinding(ctx context.Context, binding domain.ChannelBinding) error
 	ChannelBindingByProvider(ctx context.Context, channel, providerNumber string) (domain.ChannelBinding, error)
+	ChannelBindingByTenant(ctx context.Context, tenantID, channel string) (domain.ChannelBinding, error)
+	UpdateChannelSessionStatus(ctx context.Context, tenantID, channel string, status domain.SessionStatus) error
+	ListChannelBindingsByChannel(ctx context.Context, channel string) ([]domain.ChannelBinding, error)
+
+	EnqueueOutbound(ctx context.Context, entry domain.OutboundQueueEntry) error
+	ListOutboundQueue(ctx context.Context, tenantID, channel string) ([]domain.OutboundQueueEntry, error)
+	OutboundQueueDepth(ctx context.Context, tenantID, channel string) (int, error)
+	DeleteOutboundQueueEntry(ctx context.Context, id string) error
+	DeleteOldestOutboundQueueEntry(ctx context.Context, tenantID, channel string) (string, error)
 
 	CreateCaseRun(ctx context.Context, run domain.CaseRun) error
 	UpdateCaseRunStatus(ctx context.Context, tenantID, caseRunID, status string) error
@@ -31,6 +40,7 @@ type Store interface {
 	CreateReviewPacket(ctx context.Context, packet domain.ReviewPacket) error
 	GetReviewPacket(ctx context.Context, tenantID, packetID string) (domain.ReviewPacket, error)
 	MarkReviewPacketDelivered(ctx context.Context, tenantID, packetID string) error
+	LatestReviewPacket(ctx context.Context, tenantID string) (domain.ReviewPacket, error)
 
 	CreateAuditEvent(ctx context.Context, event domain.AuditEvent) (bool, error)
 	ListAuditEvents(ctx context.Context, tenantID string) ([]domain.AuditEvent, error)
@@ -43,6 +53,7 @@ type Store interface {
 	ListCorrections(ctx context.Context, tenantID string) ([]domain.Correction, error)
 
 	FindCandidate(ctx context.Context, tenantID, workflowSlug, decisionType, conditionsHash string, recommendedAction string) (domain.RuleCandidate, error)
+	ListCandidatesByConditions(ctx context.Context, tenantID, workflowSlug, decisionType, conditionsHash string) ([]domain.RuleCandidate, error)
 	ListCandidates(ctx context.Context, tenantID string) ([]domain.RuleCandidate, error)
 	GetCandidate(ctx context.Context, tenantID, candidateID string) (domain.RuleCandidate, error)
 	SaveCandidate(ctx context.Context, candidate domain.RuleCandidate) error

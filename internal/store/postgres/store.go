@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -53,10 +54,23 @@ CREATE TABLE IF NOT EXISTS channel_bindings (
 	channel TEXT NOT NULL,
 	provider_number TEXT NOT NULL,
 	tenant_id TEXT NOT NULL,
+	session_status TEXT NOT NULL DEFAULT '',
+	session_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 	data JSONB NOT NULL,
 	PRIMARY KEY (channel, provider_number)
 );
 CREATE INDEX IF NOT EXISTS channel_bindings_tenant_idx ON channel_bindings (tenant_id);
+CREATE INDEX IF NOT EXISTS channel_bindings_channel_idx ON channel_bindings (channel);
+CREATE TABLE IF NOT EXISTS outbound_queue (
+	id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL,
+	channel TEXT NOT NULL,
+	packet_id TEXT NOT NULL,
+	idempotency_key TEXT NOT NULL,
+	enqueued_at TIMESTAMPTZ NOT NULL,
+	UNIQUE (tenant_id, channel, packet_id)
+);
+CREATE INDEX IF NOT EXISTS outbound_queue_drain_idx ON outbound_queue (tenant_id, channel, enqueued_at);
 CREATE TABLE IF NOT EXISTS case_runs (
 	id TEXT PRIMARY KEY,
 	tenant_id TEXT NOT NULL,
@@ -180,7 +194,10 @@ func (s *Store) CreateTenant(ctx context.Context, tenant domain.Tenant, _ domain
 	if _, err := tx.Exec(ctx, `INSERT INTO tenants (id, data) VALUES ($1, $2)`, tenant.ID, mustJSON(tenant)); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO channel_bindings (channel, provider_number, tenant_id, data) VALUES ($1, $2, $3, $4)`, binding.Channel, binding.ProviderNumber, binding.TenantID, mustJSON(binding)); err != nil {
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO channel_bindings (channel, provider_number, tenant_id, session_status, session_updated_at, data) VALUES ($1, $2, $3, $4, $5, $6)`,
+		binding.Channel, binding.ProviderNumber, binding.TenantID, string(binding.SessionStatus), time.Now().UTC(), mustJSON(binding),
+	); err != nil {
 		return err
 	}
 	if err := insertSkillVersion(ctx, tx, initialSkillVersion); err != nil {
@@ -210,12 +227,111 @@ func (s *Store) GetWorkflowTemplate(ctx context.Context, slug string) (domain.Wo
 }
 
 func (s *Store) UpsertChannelBinding(ctx context.Context, binding domain.ChannelBinding) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO channel_bindings (channel, provider_number, tenant_id, data) VALUES ($1,$2,$3,$4) ON CONFLICT (channel, provider_number) DO UPDATE SET tenant_id=EXCLUDED.tenant_id, data=EXCLUDED.data`, binding.Channel, binding.ProviderNumber, binding.TenantID, mustJSON(binding))
+	if binding.SessionUpdated.IsZero() {
+		binding.SessionUpdated = time.Now().UTC()
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO channel_bindings (channel, provider_number, tenant_id, session_status, session_updated_at, data)
+		 VALUES ($1,$2,$3,$4,$5,$6)
+		 ON CONFLICT (channel, provider_number)
+		 DO UPDATE SET tenant_id=EXCLUDED.tenant_id, session_status=EXCLUDED.session_status, session_updated_at=EXCLUDED.session_updated_at, data=EXCLUDED.data`,
+		binding.Channel, binding.ProviderNumber, binding.TenantID, string(binding.SessionStatus), binding.SessionUpdated, mustJSON(binding),
+	)
 	return err
 }
 
 func (s *Store) ChannelBindingByProvider(ctx context.Context, channel, providerNumber string) (domain.ChannelBinding, error) {
 	return oneJSON[domain.ChannelBinding](ctx, s.pool, `SELECT data FROM channel_bindings WHERE channel=$1 AND provider_number=$2`, channel, providerNumber)
+}
+
+func (s *Store) ChannelBindingByTenant(ctx context.Context, tenantID, channel string) (domain.ChannelBinding, error) {
+	return oneJSON[domain.ChannelBinding](ctx, s.pool, `SELECT data FROM channel_bindings WHERE tenant_id=$1 AND channel=$2 LIMIT 1`, tenantID, channel)
+}
+
+func (s *Store) UpdateChannelSessionStatus(ctx context.Context, tenantID, channel string, status domain.SessionStatus) error {
+	binding, err := s.ChannelBindingByTenant(ctx, tenantID, channel)
+	if err != nil {
+		return err
+	}
+	binding.SessionStatus = status
+	binding.SessionUpdated = time.Now().UTC()
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE channel_bindings SET session_status=$1, session_updated_at=$2, data=$3 WHERE tenant_id=$4 AND channel=$5`,
+		string(status), binding.SessionUpdated, mustJSON(binding), tenantID, channel,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) ListChannelBindingsByChannel(ctx context.Context, channel string) ([]domain.ChannelBinding, error) {
+	return manyJSON[domain.ChannelBinding](ctx, s.pool, `SELECT data FROM channel_bindings WHERE channel=$1 ORDER BY tenant_id`, channel)
+}
+
+func (s *Store) EnqueueOutbound(ctx context.Context, entry domain.OutboundQueueEntry) error {
+	if entry.ID == "" {
+		entry.ID = fmt.Sprintf("oq_%s_%d", entry.PacketID, entry.EnqueuedAt.UnixNano())
+	}
+	_, err := s.pool.Exec(ctx,
+		`INSERT INTO outbound_queue (id, tenant_id, channel, packet_id, idempotency_key, enqueued_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (tenant_id, channel, packet_id) DO NOTHING`,
+		entry.ID, entry.TenantID, entry.Channel, entry.PacketID, entry.IdempotencyKey, entry.EnqueuedAt,
+	)
+	return err
+}
+
+func (s *Store) ListOutboundQueue(ctx context.Context, tenantID, channel string) ([]domain.OutboundQueueEntry, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, tenant_id, channel, packet_id, idempotency_key, enqueued_at
+		 FROM outbound_queue WHERE tenant_id=$1 AND channel=$2 ORDER BY enqueued_at, id`,
+		tenantID, channel,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.OutboundQueueEntry
+	for rows.Next() {
+		var entry domain.OutboundQueueEntry
+		if err := rows.Scan(&entry.ID, &entry.TenantID, &entry.Channel, &entry.PacketID, &entry.IdempotencyKey, &entry.EnqueuedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, entry)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) OutboundQueueDepth(ctx context.Context, tenantID, channel string) (int, error) {
+	var count int
+	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM outbound_queue WHERE tenant_id=$1 AND channel=$2`, tenantID, channel).Scan(&count)
+	return count, err
+}
+
+func (s *Store) DeleteOutboundQueueEntry(ctx context.Context, id string) error {
+	_, err := s.pool.Exec(ctx, `DELETE FROM outbound_queue WHERE id=$1`, id)
+	return err
+}
+
+func (s *Store) DeleteOldestOutboundQueueEntry(ctx context.Context, tenantID, channel string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`DELETE FROM outbound_queue
+		 WHERE id = (SELECT id FROM outbound_queue WHERE tenant_id=$1 AND channel=$2 ORDER BY enqueued_at, id LIMIT 1)
+		 RETURNING id`,
+		tenantID, channel,
+	).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	return id, nil
 }
 
 func (s *Store) CreateCaseRun(ctx context.Context, run domain.CaseRun) error {
@@ -286,6 +402,12 @@ func (s *Store) GetReviewPacket(ctx context.Context, tenantID, packetID string) 
 	return oneJSON[domain.ReviewPacket](ctx, s.pool, `SELECT data FROM review_packets WHERE id=$1 AND tenant_id=$2`, packetID, tenantID)
 }
 
+func (s *Store) LatestReviewPacket(ctx context.Context, tenantID string) (domain.ReviewPacket, error) {
+	return oneJSON[domain.ReviewPacket](ctx, s.pool,
+		`SELECT data FROM review_packets WHERE tenant_id=$1
+		 ORDER BY (data->>'expires_at') DESC LIMIT 1`, tenantID)
+}
+
 func (s *Store) MarkReviewPacketDelivered(ctx context.Context, tenantID, packetID string) error {
 	packet, err := s.GetReviewPacket(ctx, tenantID, packetID)
 	if err != nil {
@@ -351,6 +473,10 @@ func (s *Store) ListCorrections(ctx context.Context, tenantID string) ([]domain.
 
 func (s *Store) FindCandidate(ctx context.Context, tenantID, workflowSlug, decisionType, conditionsHash string, recommendedAction string) (domain.RuleCandidate, error) {
 	return oneJSON[domain.RuleCandidate](ctx, s.pool, `SELECT data FROM rule_candidates WHERE tenant_id=$1 AND workflow_slug=$2 AND decision_type=$3 AND conditions_hash=$4 AND recommended_action=$5 AND status <> 'rejected' ORDER BY id LIMIT 1`, tenantID, workflowSlug, decisionType, conditionsHash, recommendedAction)
+}
+
+func (s *Store) ListCandidatesByConditions(ctx context.Context, tenantID, workflowSlug, decisionType, conditionsHash string) ([]domain.RuleCandidate, error) {
+	return manyJSON[domain.RuleCandidate](ctx, s.pool, `SELECT data FROM rule_candidates WHERE tenant_id=$1 AND workflow_slug=$2 AND decision_type=$3 AND conditions_hash=$4 AND status <> 'rejected' ORDER BY id`, tenantID, workflowSlug, decisionType, conditionsHash)
 }
 
 func (s *Store) ListCandidates(ctx context.Context, tenantID string) ([]domain.RuleCandidate, error) {

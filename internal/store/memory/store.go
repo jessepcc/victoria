@@ -2,8 +2,10 @@ package memory
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"victoria/internal/domain"
 )
@@ -27,6 +29,8 @@ type Store struct {
 	validated     map[string]domain.ValidatedRule
 	skillVersions map[string]domain.SkillVersion
 	activeSV      map[string]string
+	outboundQueue map[string]domain.OutboundQueueEntry
+	queueSeq      int
 }
 
 func New() *Store {
@@ -47,6 +51,7 @@ func New() *Store {
 		validated:     map[string]domain.ValidatedRule{},
 		skillVersions: map[string]domain.SkillVersion{},
 		activeSV:      map[string]string{},
+		outboundQueue: map[string]domain.OutboundQueueEntry{},
 	}
 }
 
@@ -116,6 +121,108 @@ func (s *Store) ChannelBindingByProvider(_ context.Context, channel, providerNum
 		return domain.ChannelBinding{}, domain.ErrNotFound
 	}
 	return binding, nil
+}
+
+func (s *Store) ChannelBindingByTenant(_ context.Context, tenantID, channel string) (domain.ChannelBinding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, binding := range s.bindings {
+		if binding.TenantID == tenantID && binding.Channel == channel {
+			return binding, nil
+		}
+	}
+	return domain.ChannelBinding{}, domain.ErrNotFound
+}
+
+func (s *Store) UpdateChannelSessionStatus(_ context.Context, tenantID, channel string, status domain.SessionStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, binding := range s.bindings {
+		if binding.TenantID == tenantID && binding.Channel == channel {
+			binding.SessionStatus = status
+			binding.SessionUpdated = time.Now().UTC()
+			s.bindings[key] = binding
+			return nil
+		}
+	}
+	return domain.ErrNotFound
+}
+
+func (s *Store) ListChannelBindingsByChannel(_ context.Context, channel string) ([]domain.ChannelBinding, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []domain.ChannelBinding
+	for _, binding := range s.bindings {
+		if binding.Channel == channel {
+			out = append(out, binding)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].TenantID < out[j].TenantID })
+	return out, nil
+}
+
+func (s *Store) EnqueueOutbound(_ context.Context, entry domain.OutboundQueueEntry) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry.ID == "" {
+		s.queueSeq++
+		entry.ID = fmt.Sprintf("oq_%d", s.queueSeq)
+	}
+	s.outboundQueue[entry.ID] = entry
+	return nil
+}
+
+func (s *Store) ListOutboundQueue(_ context.Context, tenantID, channel string) ([]domain.OutboundQueueEntry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []domain.OutboundQueueEntry
+	for _, entry := range s.outboundQueue {
+		if entry.TenantID == tenantID && entry.Channel == channel {
+			out = append(out, entry)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].EnqueuedAt.Before(out[j].EnqueuedAt) })
+	return out, nil
+}
+
+func (s *Store) OutboundQueueDepth(_ context.Context, tenantID, channel string) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, entry := range s.outboundQueue {
+		if entry.TenantID == tenantID && entry.Channel == channel {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func (s *Store) DeleteOutboundQueueEntry(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.outboundQueue, id)
+	return nil
+}
+
+func (s *Store) DeleteOldestOutboundQueueEntry(_ context.Context, tenantID, channel string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var oldestID string
+	var oldestAt time.Time
+	for id, entry := range s.outboundQueue {
+		if entry.TenantID != tenantID || entry.Channel != channel {
+			continue
+		}
+		if oldestID == "" || entry.EnqueuedAt.Before(oldestAt) {
+			oldestID = id
+			oldestAt = entry.EnqueuedAt
+		}
+	}
+	if oldestID == "" {
+		return "", nil
+	}
+	delete(s.outboundQueue, oldestID)
+	return oldestID, nil
 }
 
 func (s *Store) CreateCaseRun(_ context.Context, run domain.CaseRun) error {
@@ -211,6 +318,24 @@ func (s *Store) GetReviewPacket(_ context.Context, tenantID, packetID string) (d
 		return domain.ReviewPacket{}, domain.ErrNotFound
 	}
 	return packet, nil
+}
+
+func (s *Store) LatestReviewPacket(_ context.Context, tenantID string) (domain.ReviewPacket, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var latest domain.ReviewPacket
+	for _, packet := range s.packets {
+		if packet.TenantID != tenantID {
+			continue
+		}
+		if latest.PacketID == "" || packet.ExpiresAt.After(latest.ExpiresAt) {
+			latest = packet
+		}
+	}
+	if latest.PacketID == "" {
+		return domain.ReviewPacket{}, domain.ErrNotFound
+	}
+	return latest, nil
 }
 
 func (s *Store) MarkReviewPacketDelivered(_ context.Context, tenantID, packetID string) error {
@@ -320,6 +445,23 @@ func (s *Store) FindCandidate(_ context.Context, tenantID, workflowSlug, decisio
 		}
 	}
 	return domain.RuleCandidate{}, domain.ErrNotFound
+}
+
+func (s *Store) ListCandidatesByConditions(_ context.Context, tenantID, workflowSlug, decisionType, conditionsHash string) ([]domain.RuleCandidate, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []domain.RuleCandidate
+	for _, candidate := range s.candidates {
+		if candidate.TenantID == tenantID &&
+			candidate.WorkflowSlug == workflowSlug &&
+			candidate.DecisionType == decisionType &&
+			candidate.ConditionsHash == conditionsHash &&
+			candidate.Status != "rejected" {
+			out = append(out, cloneCandidate(candidate))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 func (s *Store) ListCandidates(_ context.Context, tenantID string) ([]domain.RuleCandidate, error) {
