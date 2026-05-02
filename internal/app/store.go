@@ -45,6 +45,14 @@ type Store interface {
 	CreateAuditEvent(ctx context.Context, event domain.AuditEvent) (bool, error)
 	ListAuditEvents(ctx context.Context, tenantID string) ([]domain.AuditEvent, error)
 	HasApprovalAudit(ctx context.Context, tenantID, caseRunID, decisionPointID string) (bool, error)
+	ApprovalAuditID(ctx context.Context, tenantID, caseRunID, decisionPointID string) (string, error)
+
+	CreateCustomerMessage(ctx context.Context, msg domain.CustomerMessage) (bool, domain.CustomerMessage, error)
+	CustomerMessageBySource(ctx context.Context, tenantID, channel, sourceMessageID string) (domain.CustomerMessage, error)
+	UpdateCustomerMessageCase(ctx context.Context, tenantID, channel, sourceMessageID, caseRunID, status string) error
+
+	UpsertOutboundToCustomer(ctx context.Context, out domain.OutboundToCustomer) (bool, domain.OutboundToCustomer, error)
+	OutboundToCustomerByCaseAndHash(ctx context.Context, tenantID, caseRunID, bodyHash string) (domain.OutboundToCustomer, error)
 
 	SeenSignal(ctx context.Context, signalID string) (bool, error)
 	MarkSignalSeen(ctx context.Context, signalID string) error

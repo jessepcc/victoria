@@ -225,6 +225,78 @@ func TestHTTPMCPWriteFinalBoundTenantFromAuth(t *testing.T) {
 	}, nil, http.StatusForbidden)
 }
 
+func TestHTTPCustomerInboundAndWhatsAppAllowlistAPI(t *testing.T) {
+	application := app.New(memory.New())
+	server := httptest.NewServer(httpapi.New(application, nil).Handler())
+	t.Cleanup(server.Close)
+
+	var provision struct {
+		Tenant domain.Tenant `json:"tenant"`
+	}
+	post(t, server.URL+"/admin/tenants", "", map[string]any{
+		"name":            "Tenant A",
+		"vertical":        "roofing",
+		"provider_number": "+61400000000",
+		"operator_id":     "op_telegram:a",
+	}, &provision, http.StatusCreated)
+
+	var consent struct {
+		Binding domain.ChannelBinding `json:"binding"`
+	}
+	post(t, server.URL+"/channel-bindings/whatsapp/consent", provision.Tenant.ID, map[string]any{
+		"inbound_mode":       "read_only",
+		"draft_delivery_jid": "85270000000@s.whatsapp.net",
+	}, &consent, http.StatusOK)
+	if consent.Binding.ConsentAcknowledgedAt == nil {
+		t.Fatal("consent timestamp missing")
+	}
+
+	var customers struct {
+		Customers []string `json:"customers"`
+	}
+	post(t, server.URL+"/channel-bindings/whatsapp/customers", provision.Tenant.ID, map[string]any{
+		"customer": "+85299999999",
+	}, &customers, http.StatusOK)
+	if len(customers.Customers) != 1 || customers.Customers[0] != "85299999999@s.whatsapp.net" {
+		t.Fatalf("customers = %+v", customers.Customers)
+	}
+	deleteJSON(t, server.URL+"/channel-bindings/whatsapp/customers", provision.Tenant.ID, map[string]any{
+		"customer": "85299999999@s.whatsapp.net",
+	}, &customers, http.StatusOK)
+	if len(customers.Customers) != 0 {
+		t.Fatalf("customers after delete = %+v, want empty", customers.Customers)
+	}
+
+	var ingest struct {
+		CaseRunID string `json:"case_run_id"`
+	}
+	post(t, server.URL+"/ingest/customer-message", provision.Tenant.ID, map[string]any{
+		"channel":             "email",
+		"source_message_id":   "m1",
+		"customer_identifier": "customer@example.com",
+		"received_at":         "2026-05-02T10:00:00Z",
+		"subject":             "Need a quote",
+		"body_text":           "Can I get a quote?",
+	}, &ingest, http.StatusAccepted)
+	if ingest.CaseRunID == "" {
+		t.Fatal("case_run_id missing from ingestion response")
+	}
+	var duplicate struct {
+		CaseRunID string `json:"case_run_id"`
+	}
+	post(t, server.URL+"/ingest/customer-message", provision.Tenant.ID, map[string]any{
+		"channel":             "email",
+		"source_message_id":   "m1",
+		"customer_identifier": "customer@example.com",
+		"received_at":         "2026-05-02T10:00:00Z",
+		"subject":             "Need a quote",
+		"body_text":           "Can I get a quote?",
+	}, &duplicate, http.StatusAccepted)
+	if duplicate.CaseRunID != ingest.CaseRunID {
+		t.Fatalf("duplicate case_run_id = %s, want %s", duplicate.CaseRunID, ingest.CaseRunID)
+	}
+}
+
 func post(t *testing.T, url string, tenantID string, body any, out any, wantStatus int) {
 	t.Helper()
 	headers := map[string]string{"Content-Type": "application/json"}
@@ -256,6 +328,37 @@ func postWithHeaders(t *testing.T, url string, headers map[string]string, body a
 		var errBody map[string]any
 		_ = json.NewDecoder(res.Body).Decode(&errBody)
 		t.Fatalf("POST %s status = %d body=%v, want %d", url, res.StatusCode, errBody, wantStatus)
+	}
+	if out != nil {
+		if err := json.NewDecoder(res.Body).Decode(out); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func deleteJSON(t *testing.T, url string, tenantID string, body any, out any, wantStatus int) {
+	t.Helper()
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodDelete, url, bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if tenantID != "" {
+		req.Header.Set("Authorization", "Bearer tid:"+tenantID)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != wantStatus {
+		var errBody map[string]any
+		_ = json.NewDecoder(res.Body).Decode(&errBody)
+		t.Fatalf("DELETE %s status = %d body=%v, want %d", url, res.StatusCode, errBody, wantStatus)
 	}
 	if out != nil {
 		if err := json.NewDecoder(res.Body).Decode(out); err != nil {

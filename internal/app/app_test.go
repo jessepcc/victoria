@@ -571,6 +571,193 @@ func TestReplayUsesMCPReadSnapshot(t *testing.T) {
 	}
 }
 
+func TestIngestCustomerMessageCreatesCaseAndIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+
+	event := IngestionEvent{
+		TenantID:           tenant.ID,
+		Channel:            "email",
+		SourceMessageID:    "imap-uid-123",
+		CustomerIdentifier: "customer@example.com",
+		ReceivedAt:         time.Date(2026, 5, 2, 9, 30, 0, 0, time.UTC),
+		Subject:            "Need a roof quote",
+		BodyText:           "Hi, can you quote a roof repair this week?",
+		Metadata:           map[string]any{"folder": "INBOX"},
+	}
+
+	firstCaseID, err := application.IngestCustomerMessage(ctx, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCaseID, err := application.IngestCustomerMessage(ctx, event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCaseID == "" || secondCaseID != firstCaseID {
+		t.Fatalf("case ids = %q/%q, want same non-empty id", firstCaseID, secondCaseID)
+	}
+
+	msg, err := store.CustomerMessageBySource(ctx, tenant.ID, "email", "imap-uid-123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.CaseRunID != firstCaseID || msg.Status != "ingested" {
+		t.Fatalf("stored customer message = %+v", msg)
+	}
+	run, err := store.GetCaseRun(ctx, tenant.ID, firstCaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.WorkflowSlug != "enquiry_triage" {
+		t.Fatalf("workflow = %s, want enquiry_triage", run.WorkflowSlug)
+	}
+	if run.InputPayload["body_text"] != event.BodyText || run.InputPayload["customer_identifier"] != event.CustomerIdentifier {
+		t.Fatalf("payload not populated from ingestion event: %+v", run.InputPayload)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "customer_message_received") != 1 {
+		t.Fatalf("customer_message_received count = %d, want 1", countEvents(events, "customer_message_received"))
+	}
+}
+
+func TestHandleWhatsAppInboundA0RoutesOnlyAllowlistedCustomers(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeReadOnly,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "85211111111",
+		SenderJID:         "85211111111@s.whatsapp.net",
+		ProviderMessageID: "ignored-1",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "personal message that must stay out of customer_messages",
+		ReceivedAt:        time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CustomerMessageBySource(ctx, tenant.ID, "whatsapp_a0", "ignored-1"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("non-allowlisted message reached customer_messages err=%v", err)
+	}
+
+	if err := application.AddWhatsAppCustomer(ctx, tenant.ID, "+85211111111"); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "85211111111",
+		SenderJID:         "85211111111@s.whatsapp.net",
+		ProviderMessageID: "allowed-1",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "Can you quote a bathroom renovation?",
+		ReceivedAt:        time.Date(2026, 5, 2, 10, 1, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.CustomerMessageBySource(ctx, tenant.ID, "whatsapp_a0", "allowed-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.CaseRunID == "" {
+		t.Fatalf("allowlisted customer message did not create case: %+v", stored)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "customer_message_received") != 1 {
+		t.Fatalf("customer_message_received count = %d, want 1", countEvents(events, "customer_message_received"))
+	}
+}
+
+func TestHandleWhatsAppInboundA0CommandsManageAllowlistAndPause(t *testing.T) {
+	ctx := context.Background()
+	application, store, clock, tenant := newTestApp(t)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeReadOnly,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		IsFromMe:          true,
+		SenderIdentifier:  "61400000000",
+		SenderJID:         "61400000000@s.whatsapp.net",
+		ProviderMessageID: "cmd-add",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "add customer +85299999999",
+		ReceivedAt:        clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.ChannelBindingByTenant(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(binding.CustomerAllowlist, "85299999999@s.whatsapp.net") {
+		t.Fatalf("allowlist = %+v, want customer JID", binding.CustomerAllowlist)
+	}
+
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		IsFromMe:          true,
+		SenderIdentifier:  "61400000000",
+		SenderJID:         "61400000000@s.whatsapp.net",
+		ProviderMessageID: "cmd-pause",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "pause",
+		ReceivedAt:        clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "85299999999",
+		SenderJID:         "85299999999@s.whatsapp.net",
+		ProviderMessageID: "paused-customer",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "Are you available today?",
+		ReceivedAt:        clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CustomerMessageBySource(ctx, tenant.ID, "whatsapp_a0", "paused-customer"); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("paused message reached customer_messages err=%v", err)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "customer_intake_paused") != 1 {
+		t.Fatalf("customer_intake_paused count = %d, want 1", countEvents(events, "customer_intake_paused"))
+	}
+}
+
+func TestHandleTelegramInboundClassifiesConfiguredCustomerChats(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	binding, err := store.ChannelBindingByTenant(ctx, tenant.ID, string(channel.ChannelTelegram))
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding.TelegramCustomerChats = []string{"chat_customer"}
+	if err := store.UpsertChannelBinding(ctx, binding); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := application.HandleTelegramInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "chat_customer",
+		ProviderMessageID: "tg-customer-1",
+		Channel:           channel.ChannelTelegram,
+		FreeText:          "I need help with my quote",
+		ReceivedAt:        time.Date(2026, 5, 2, 11, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := store.CustomerMessageBySource(ctx, tenant.ID, "telegram", "tg-customer-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.CaseRunID == "" {
+		t.Fatalf("telegram customer chat did not create case: %+v", msg)
+	}
+}
+
 func TestQueuedPacketNotMarkedDeliveredDuringOutage(t *testing.T) {
 	ctx := context.Background()
 	application, store, _, tenant := newTestApp(t)
@@ -609,6 +796,7 @@ func TestQueuedPacketNotMarkedDeliveredDuringOutage(t *testing.T) {
 // network.
 type fakeWAAdapter struct {
 	sentPacketIDs []string
+	sent          []channel.OutboundMessage
 	failNext      bool
 }
 
@@ -619,6 +807,7 @@ func (a *fakeWAAdapter) SendOutbound(_ context.Context, msg channel.OutboundMess
 		return channel.DeliveryReceipt{}, fmt.Errorf("simulated send failure")
 	}
 	a.sentPacketIDs = append(a.sentPacketIDs, msg.PacketID)
+	a.sent = append(a.sent, msg)
 	return channel.DeliveryReceipt{ProviderMessageID: "wa:" + msg.PacketID, SentAt: time.Now()}, nil
 }
 func (*fakeWAAdapter) NormalizeInboundWebhook([]byte) ([]channel.InboundMessage, error) {
@@ -676,6 +865,201 @@ func TestWhatsAppOutageQueuesDurablyAndDrainsOnReconnect(t *testing.T) {
 	depthAfter, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
 	if depthAfter != 0 {
 		t.Fatalf("queue depth after drain = %d, want 0", depthAfter)
+	}
+}
+
+func TestA0ApprovalDeliversDraftToOperatorOnly(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{}
+	application.RegisterChannelAdapter(wa)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode:      domain.InboundModeReadOnly,
+		DraftDeliveryJID: "85270000000@s.whatsapp.net",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+	run, packet, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("approval-draft"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendCountBeforeApproval := len(wa.sent)
+	if _, err := application.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:         "whatsapp",
+		ProviderNumber:  "+61400000000",
+		PacketID:        packet.PacketID,
+		SourceMessageID: "approve-a0",
+		ActionButton:    domain.ActionApprove,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sent) != sendCountBeforeApproval+1 {
+		t.Fatalf("approval sends = %d after %d, want one draft delivery", len(wa.sent), sendCountBeforeApproval)
+	}
+	draft := wa.sent[len(wa.sent)-1]
+	if draft.RecipientIdentifier != "85270000000@s.whatsapp.net" {
+		t.Fatalf("draft recipient = %s, want configured draft delivery JID", draft.RecipientIdentifier)
+	}
+	if !strings.Contains(draft.BodyText, "Approved. Here's the draft") {
+		t.Fatalf("draft body missing approval wrapper: %q", draft.BodyText)
+	}
+	outbound, err := store.OutboundToCustomerByCaseAndHash(ctx, tenant.ID, run.ID, domain.SHA256Key(draft.BodyText))
+	if !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("A0 approval wrote outbound_to_customer row: %+v err=%v", outbound, err)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "outbound_draft_delivered_to_operator") != 1 {
+		t.Fatalf("outbound_draft_delivered_to_operator count = %d, want 1", countEvents(events, "outbound_draft_delivered_to_operator"))
+	}
+}
+
+func TestA1ApprovalSendsToCustomerWithMCPGateAndIdempotentRecord(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{}
+	application.RegisterChannelAdapter(wa)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeFullControl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.RegisterWhatsAppCommandIdentity(ctx, tenant.ID, "61411111111@s.whatsapp.net"); err != nil {
+		t.Fatal(err)
+	}
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+	run, packet, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeLive,
+		Payload: map[string]any{
+			"sandbox":             true,
+			"client_type":         "new",
+			"photos_complete":     true,
+			"customer_identifier": "85288888888@s.whatsapp.net",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendCountBeforeApproval := len(wa.sent)
+	if _, err := application.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:         "whatsapp",
+		ProviderNumber:  "+61400000000",
+		PacketID:        packet.PacketID,
+		SourceMessageID: "approve-a1",
+		ActionButton:    domain.ActionApprove,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sent) != sendCountBeforeApproval+1 {
+		t.Fatalf("approval sends = %d after %d, want one customer delivery", len(wa.sent), sendCountBeforeApproval)
+	}
+	customerSend := wa.sent[len(wa.sent)-1]
+	if customerSend.RecipientIdentifier != "85288888888@s.whatsapp.net" {
+		t.Fatalf("customer send recipient = %s", customerSend.RecipientIdentifier)
+	}
+	record, err := store.OutboundToCustomerByCaseAndHash(ctx, tenant.ID, run.ID, domain.SHA256Key(customerSend.BodyText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != "sent" || record.ProviderMessageID == "" {
+		t.Fatalf("outbound record = %+v", record)
+	}
+	if _, err := application.SendApprovedCustomerReply(ctx, tenant.ID, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sent) != sendCountBeforeApproval+1 {
+		t.Fatalf("replay sent duplicate customer message; sends=%d", len(wa.sent))
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "customer_outbound_sent") != 1 {
+		t.Fatalf("customer_outbound_sent count = %d, want 1", countEvents(events, "customer_outbound_sent"))
+	}
+}
+
+func TestA1OutboundRequiresApprovalAudit(t *testing.T) {
+	ctx := context.Background()
+	application, _, _, tenant := newTestApp(t)
+	application.RegisterChannelAdapter(&fakeWAAdapter{})
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeFullControl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeLive,
+		Payload: map[string]any{
+			"sandbox":             true,
+			"customer_identifier": "85288888888@s.whatsapp.net",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.SendApprovedCustomerReply(ctx, tenant.ID, run.ID); !errors.Is(err, domain.ErrApprovalRequired) {
+		t.Fatalf("send without approval err = %v, want approval required", err)
+	}
+}
+
+func TestA1OutboundRetriesQueuedRecordAfterProviderFailure(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{failNext: true}
+	application.RegisterChannelAdapter(wa)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeFullControl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, packet, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeLive,
+		Payload: map[string]any{
+			"sandbox":             true,
+			"customer_identifier": "85288888888@s.whatsapp.net",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := application.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:         "whatsapp",
+		ProviderNumber:  "+61400000000",
+		PacketID:        packet.PacketID,
+		SourceMessageID: "approve-a1-retry",
+		ActionButton:    domain.ActionApprove,
+	}); err == nil {
+		t.Fatal("expected first provider send to fail")
+	}
+	bodyHash := domain.SHA256Key(draftBodyForRun(run))
+	queued, err := store.OutboundToCustomerByCaseAndHash(ctx, tenant.ID, run.ID, bodyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Status != "queued" {
+		t.Fatalf("status after failed send = %s, want queued", queued.Status)
+	}
+	if _, err := application.SendApprovedCustomerReply(ctx, tenant.ID, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := store.OutboundToCustomerByCaseAndHash(ctx, tenant.ID, run.ID, bodyHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent.Status != "sent" || sent.ProviderMessageID == "" {
+		t.Fatalf("status after retry = %+v, want sent with provider id", sent)
+	}
+	if len(wa.sent) != 1 {
+		t.Fatalf("successful provider sends = %d, want 1", len(wa.sent))
 	}
 }
 

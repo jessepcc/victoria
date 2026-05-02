@@ -283,13 +283,74 @@ type AuditEvent struct {
 	OccurredAt     time.Time      `json:"occurred_at"`
 }
 
+type InboundMode string
+
+const (
+	InboundModeReadOnly    InboundMode = "read_only"
+	InboundModeFullControl InboundMode = "full_control"
+)
+
+func ParseInboundMode(value string) InboundMode {
+	switch value {
+	case string(InboundModeFullControl):
+		return InboundModeFullControl
+	default:
+		return InboundModeReadOnly
+	}
+}
+
+func (m InboundMode) Valid() bool {
+	return m == InboundModeReadOnly || m == InboundModeFullControl
+}
+
 type ChannelBinding struct {
-	TenantID       string        `json:"tenant_id"`
-	Channel        string        `json:"channel"`
-	ProviderNumber string        `json:"provider_number"`
-	OperatorID     string        `json:"operator_id"`
-	SessionStatus  SessionStatus `json:"session_status"`
-	SessionUpdated time.Time     `json:"session_updated_at"`
+	TenantID                    string        `json:"tenant_id"`
+	Channel                     string        `json:"channel"`
+	ProviderNumber              string        `json:"provider_number"`
+	OperatorID                  string        `json:"operator_id"`
+	SessionStatus               SessionStatus `json:"session_status"`
+	SessionUpdated              time.Time     `json:"session_updated_at"`
+	InboundMode                 InboundMode   `json:"inbound_mode,omitempty"`
+	CommandIdentities           []string      `json:"command_identities,omitempty"`
+	CustomerAllowlist           []string      `json:"customer_allowlist,omitempty"`
+	ConsentAcknowledgedAt       *time.Time    `json:"consent_acknowledged_at,omitempty"`
+	CustomerIntakePausedUntil   *time.Time    `json:"customer_intake_paused_until,omitempty"`
+	RetentionMinutes            int           `json:"retention_minutes,omitempty"`
+	DraftDeliveryJID            string        `json:"draft_delivery_jid,omitempty"`
+	OperatorJID                 string        `json:"operator_jid,omitempty"`
+	TelegramCustomerChats       []string      `json:"telegram_customer_chats,omitempty"`
+	CommandRegistrationSecret   string        `json:"command_registration_secret,omitempty"`
+	CommandSecretConsumedAt     *time.Time    `json:"command_secret_consumed_at,omitempty"`
+	LastRepairAt                *time.Time    `json:"last_repair_at,omitempty"`
+	BanGraceHours               int           `json:"ban_grace_hours,omitempty"`
+	CustomerOutboundPausedUntil *time.Time    `json:"customer_outbound_paused_until,omitempty"`
+}
+
+type CustomerMessage struct {
+	ID                 string         `json:"id"`
+	TenantID           string         `json:"tenant_id"`
+	Channel            string         `json:"channel"`
+	SourceMessageID    string         `json:"source_message_id"`
+	CustomerIdentifier string         `json:"customer_identifier"`
+	ReceivedAt         time.Time      `json:"received_at"`
+	Subject            string         `json:"subject,omitempty"`
+	BodyText           string         `json:"body_text"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
+	CaseRunID          string         `json:"case_run_id,omitempty"`
+	Status             string         `json:"status"`
+}
+
+type OutboundToCustomer struct {
+	ID                  string     `json:"id"`
+	TenantID            string     `json:"tenant_id"`
+	CaseRunID           string     `json:"case_run_id"`
+	Channel             string     `json:"channel"`
+	RecipientIdentifier string     `json:"recipient_identifier"`
+	BodyHash            string     `json:"body_hash"`
+	MCPApprovalAuditID  string     `json:"mcp_approval_audit_id"`
+	ProviderMessageID   string     `json:"provider_message_id,omitempty"`
+	SentAt              *time.Time `json:"sent_at,omitempty"`
+	Status              string     `json:"status"`
 }
 
 // SessionStatus tracks the WhatsApp/Telegram session lifecycle per

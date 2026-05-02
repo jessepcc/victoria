@@ -99,12 +99,15 @@ func (a *App) ProvisionTenant(ctx context.Context, name, vertical, providerNumbe
 	// Pre-create the WhatsApp binding so the operator can pair from day 1.
 	// Status starts as qr_needed; pairing transitions it to connecting → active.
 	waBinding := domain.ChannelBinding{
-		TenantID:       tenant.ID,
-		Channel:        "whatsapp",
-		ProviderNumber: providerNumber,
-		OperatorID:     operatorID,
-		SessionStatus:  domain.SessionQRNeeded,
-		SessionUpdated: now,
+		TenantID:         tenant.ID,
+		Channel:          "whatsapp",
+		ProviderNumber:   providerNumber,
+		OperatorID:       operatorID,
+		SessionStatus:    domain.SessionQRNeeded,
+		SessionUpdated:   now,
+		InboundMode:      domain.InboundModeReadOnly,
+		RetentionMinutes: 30,
+		OperatorJID:      normalizeWhatsAppJID(providerNumber),
 	}
 	if err := a.store.UpsertChannelBinding(ctx, waBinding); err != nil {
 		return domain.Tenant{}, domain.ProvisioningManifest{}, err
@@ -136,6 +139,184 @@ type StartCaseInput struct {
 	WorkflowSlug string         `json:"workflow_slug"`
 	Mode         domain.Mode    `json:"mode"`
 	Payload      map[string]any `json:"payload"`
+}
+
+type IngestionEvent struct {
+	TenantID           string         `json:"tenant_id,omitempty"`
+	Channel            string         `json:"channel"`
+	SourceMessageID    string         `json:"source_message_id"`
+	CustomerIdentifier string         `json:"customer_identifier"`
+	ReceivedAt         time.Time      `json:"received_at"`
+	Subject            string         `json:"subject,omitempty"`
+	BodyText           string         `json:"body_text"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
+}
+
+type AcknowledgeWhatsAppConsentInput struct {
+	InboundMode      domain.InboundMode `json:"inbound_mode"`
+	DraftDeliveryJID string             `json:"draft_delivery_jid,omitempty"`
+	OperatorJID      string             `json:"operator_jid,omitempty"`
+}
+
+func (a *App) AcknowledgeWhatsAppConsent(ctx context.Context, tenantID string, input AcknowledgeWhatsAppConsentInput) error {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return err
+	}
+	mode := input.InboundMode
+	if mode == "" {
+		mode = domain.InboundModeReadOnly
+	}
+	if !mode.Valid() {
+		return domain.ErrInvalidInput
+	}
+	now := a.clock.Now().UTC()
+	binding.InboundMode = mode
+	binding.ConsentAcknowledgedAt = &now
+	if binding.RetentionMinutes <= 0 {
+		binding.RetentionMinutes = 30
+	}
+	if input.OperatorJID != "" {
+		binding.OperatorJID = normalizeWhatsAppJID(input.OperatorJID)
+	}
+	if binding.OperatorJID == "" {
+		binding.OperatorJID = normalizeWhatsAppJID(binding.ProviderNumber)
+	}
+	if input.DraftDeliveryJID != "" {
+		binding.DraftDeliveryJID = normalizeWhatsAppJID(input.DraftDeliveryJID)
+	}
+	if binding.DraftDeliveryJID == "" && mode == domain.InboundModeReadOnly {
+		binding.DraftDeliveryJID = binding.OperatorJID
+	}
+	binding.SessionUpdated = now
+	if err := a.store.UpsertChannelBinding(ctx, binding); err != nil {
+		return err
+	}
+	_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, tenantID, "whatsapp_consent_acknowledged", "operator", binding.OperatorID, "channel_binding", string(channel.ChannelWhatsApp), nil, map[string]any{
+		"inbound_mode": string(mode),
+	}, "wa-consent", tenantID, string(mode), now.Format(time.RFC3339Nano)))
+	return err
+}
+
+func (a *App) AddWhatsAppCustomer(ctx context.Context, tenantID, customer string) error {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return err
+	}
+	jid := normalizeWhatsAppJID(customer)
+	if jid == "" {
+		return domain.ErrInvalidInput
+	}
+	binding.CustomerAllowlist = appendIfMissing(binding.CustomerAllowlist, jid)
+	binding.SessionUpdated = a.clock.Now().UTC()
+	return a.store.UpsertChannelBinding(ctx, binding)
+}
+
+func (a *App) RemoveWhatsAppCustomer(ctx context.Context, tenantID, customer string) error {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return err
+	}
+	jid := normalizeWhatsAppJID(customer)
+	if jid == "" {
+		return domain.ErrInvalidInput
+	}
+	binding.CustomerAllowlist = removeString(binding.CustomerAllowlist, jid)
+	binding.SessionUpdated = a.clock.Now().UTC()
+	return a.store.UpsertChannelBinding(ctx, binding)
+}
+
+func (a *App) ListWhatsAppCustomers(ctx context.Context, tenantID string) ([]string, error) {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return nil, err
+	}
+	out := append([]string(nil), binding.CustomerAllowlist...)
+	sort.Strings(out)
+	return out, nil
+}
+
+func (a *App) RegisterWhatsAppCommandIdentity(ctx context.Context, tenantID, jid string) error {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return err
+	}
+	normalized := normalizeWhatsAppJID(jid)
+	if normalized == "" {
+		return domain.ErrInvalidInput
+	}
+	binding.CommandIdentities = appendIfMissing(binding.CommandIdentities, normalized)
+	binding.SessionUpdated = a.clock.Now().UTC()
+	return a.store.UpsertChannelBinding(ctx, binding)
+}
+
+func (a *App) RecordOutboundBlocked(ctx context.Context, tenantID, dstJID, bodyHash, callSite string) error {
+	_, err := a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "outbound_blocked_to_customer", "system", "whatsapp", "channel_binding", string(channel.ChannelWhatsApp), nil, map[string]any{
+		"dst_jid":         dstJID,
+		"body_hash":       bodyHash,
+		"call_site_stack": callSite,
+	}, "outbound-blocked-to-customer", tenantID, dstJID, bodyHash, a.clock.Now().Format(time.RFC3339Nano)))
+	return err
+}
+
+func (a *App) IngestCustomerMessage(ctx context.Context, event IngestionEvent) (string, error) {
+	event.TenantID = strings.TrimSpace(event.TenantID)
+	event.Channel = strings.TrimSpace(event.Channel)
+	event.SourceMessageID = strings.TrimSpace(event.SourceMessageID)
+	event.CustomerIdentifier = strings.TrimSpace(event.CustomerIdentifier)
+	event.BodyText = strings.TrimSpace(event.BodyText)
+	if event.TenantID == "" || event.Channel == "" || event.SourceMessageID == "" || event.CustomerIdentifier == "" || event.BodyText == "" {
+		return "", domain.ErrInvalidInput
+	}
+	if event.ReceivedAt.IsZero() {
+		event.ReceivedAt = a.clock.Now()
+	}
+	if _, err := a.store.GetTenant(ctx, event.TenantID); err != nil {
+		return "", err
+	}
+	msg := domain.CustomerMessage{
+		ID:                 a.ids.NewID("cm"),
+		TenantID:           event.TenantID,
+		Channel:            event.Channel,
+		SourceMessageID:    event.SourceMessageID,
+		CustomerIdentifier: event.CustomerIdentifier,
+		ReceivedAt:         event.ReceivedAt.UTC(),
+		Subject:            event.Subject,
+		BodyText:           event.BodyText,
+		Metadata:           cloneMap(event.Metadata),
+		Status:             "ingested",
+	}
+	created, stored, err := a.store.CreateCustomerMessage(ctx, msg)
+	if err != nil {
+		return "", err
+	}
+	if !created {
+		return stored.CaseRunID, nil
+	}
+	run, _, err := a.StartCase(ctx, StartCaseInput{
+		TenantID:     event.TenantID,
+		WorkflowSlug: "enquiry_triage",
+		Mode:         domain.ModeSandbox,
+		Payload:      payloadFromIngestionEvent(event),
+	})
+	if err != nil {
+		_ = a.store.UpdateCustomerMessageCase(ctx, event.TenantID, event.Channel, event.SourceMessageID, "", "failed")
+		return "", err
+	}
+	if err := a.store.UpdateCustomerMessageCase(ctx, event.TenantID, event.Channel, event.SourceMessageID, run.ID, "ingested"); err != nil {
+		return "", err
+	}
+	_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), event.TenantID, "customer_message_received", "customer", event.CustomerIdentifier, "customer_message", msg.ID, map[string]any{
+		"case_run_id": run.ID,
+	}, map[string]any{
+		"channel":             event.Channel,
+		"source_message_id":   event.SourceMessageID,
+		"customer_identifier": event.CustomerIdentifier,
+	}, "customer-message-received", event.TenantID, event.Channel, event.SourceMessageID))
+	if err != nil {
+		return "", err
+	}
+	return run.ID, nil
 }
 
 func (a *App) StartCase(ctx context.Context, input StartCaseInput) (domain.CaseRun, domain.ReviewPacket, error) {
@@ -292,18 +473,43 @@ func (a *App) GetChannelBinding(ctx context.Context, tenantID, ch string) (domai
 // normalized by the whatsmeow Manager) into the gateway's correction loop.
 //
 // Two-state conversation:
-//   1. If the gateway has a pending follow-up for this tenant (we previously
-//      asked "what should I have done?"), the current message is the
-//      correction reasoning — log it as a wrong_action correction and clear
-//      the follow-up state.
-//   2. Otherwise classify intent: yes/no/other. "no" without an inline
-//      reason starts a follow-up turn. "no with reason" or other substantive
-//      text becomes a correction immediately. "yes" approves; any text
-//      after "yes" rides along as a free-text note on the envelope.
+//  1. If the gateway has a pending follow-up for this tenant (we previously
+//     asked "what should I have done?"), the current message is the
+//     correction reasoning — log it as a wrong_action correction and clear
+//     the follow-up state.
+//  2. Otherwise classify intent: yes/no/other. "no" without an inline
+//     reason starts a follow-up turn. "no with reason" or other substantive
+//     text becomes a correction immediately. "yes" approves; any text
+//     after "yes" rides along as a free-text note on the envelope.
 func (a *App) HandleWhatsAppInbound(ctx context.Context, tenantID string, msg channel.InboundMessage) error {
 	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
 	if err != nil {
 		return fmt.Errorf("inbound: lookup binding: %w", err)
+	}
+	mode := domain.ParseInboundMode(string(binding.InboundMode))
+	senderJID := normalizeInboundJID(msg)
+	if handled, err := a.handleWhatsAppCommand(ctx, tenantID, binding, msg, senderJID); handled || err != nil {
+		return err
+	}
+	switch mode {
+	case domain.InboundModeReadOnly:
+		if !msg.IsFromMe && !contains(binding.CustomerAllowlist, senderJID) {
+			_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "wa_inbound_ignored", "customer", senderJID, "message", msg.ProviderMessageID, nil, map[string]any{
+				"channel": string(channel.ChannelWhatsApp),
+				"kind":    "ignored",
+			}, "wa-ignored", tenantID, msg.ProviderMessageID))
+			return nil
+		}
+		if !msg.IsFromMe {
+			return a.routeWhatsAppCustomerMessage(ctx, tenantID, binding, msg, senderJID, "whatsapp_a0")
+		}
+	case domain.InboundModeFullControl:
+		if msg.IsFromMe {
+			return nil
+		}
+		if !contains(binding.CommandIdentities, senderJID) {
+			return a.routeWhatsAppCustomerMessage(ctx, tenantID, binding, msg, senderJID, "whatsapp_a1")
+		}
 	}
 	packetID := extractPacketReference(msg.FreeText)
 	if packetID == "" {
@@ -346,6 +552,138 @@ func (a *App) HandleWhatsAppInbound(ctx context.Context, tenantID string, msg ch
 		"sender":    msg.SenderIdentifier,
 	}, "deadletter", tenantID, msg.ProviderMessageID))
 	return nil
+}
+
+func (a *App) HandleTelegramInbound(ctx context.Context, tenantID string, msg channel.InboundMessage) error {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelTelegram))
+	if err != nil {
+		return err
+	}
+	if contains(binding.TelegramCustomerChats, msg.SenderIdentifier) {
+		_, err := a.IngestCustomerMessage(ctx, IngestionEvent{
+			TenantID:           tenantID,
+			Channel:            "telegram",
+			SourceMessageID:    msg.ProviderMessageID,
+			CustomerIdentifier: msg.SenderIdentifier,
+			ReceivedAt:         msg.ReceivedAt,
+			BodyText:           msg.FreeText,
+		})
+		return err
+	}
+	packetID := extractPacketReference(msg.FreeText)
+	if packetID == "" {
+		if latest, err := a.store.LatestReviewPacket(ctx, tenantID); err == nil {
+			packetID = latest.PacketID
+		}
+	}
+	intent := classifyIntent(msg.FreeText)
+	switch intent.kind {
+	case "approve":
+		return a.dispatchInbound(ctx, tenantID, binding, packetID, msg, domain.ActionApprove, intent.note)
+	case "reject_with_reason":
+		return a.dispatchInbound(ctx, tenantID, binding, packetID, msg, domain.ActionWrongAction, intent.note)
+	case "reject_need_followup":
+		a.gateway.SetPendingFollowup(tenantID, packetID)
+		a.gateway.SendNotification(ctx, tenantID, "Got it — what should I have done instead? Just type the reason.")
+		return nil
+	case "promote":
+		return a.handlePromoteCommand(ctx, tenantID, binding.OperatorID)
+	case "correction":
+		return a.dispatchInbound(ctx, tenantID, binding, packetID, msg, domain.ActionWrongAction, intent.note)
+	default:
+		return nil
+	}
+}
+
+func (a *App) handleWhatsAppCommand(ctx context.Context, tenantID string, binding domain.ChannelBinding, msg channel.InboundMessage, senderJID string) (bool, error) {
+	clean := strings.TrimSpace(msg.FreeText)
+	lower := strings.ToLower(clean)
+	isOperator := msg.IsFromMe || contains(binding.CommandIdentities, senderJID)
+	switch {
+	case strings.HasPrefix(lower, "register me as operator "):
+		secret := strings.TrimSpace(clean[len("register me as operator "):])
+		if binding.CommandRegistrationSecret == "" || binding.CommandSecretConsumedAt != nil || secret != binding.CommandRegistrationSecret {
+			_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "command_registration_rejected", "operator", senderJID, "channel_binding", string(channel.ChannelWhatsApp), nil, map[string]any{
+				"reason": "invalid_secret",
+			}, "command-registration-rejected", tenantID, senderJID, msg.ProviderMessageID))
+			a.gateway.SendNotification(ctx, tenantID, "unknown command")
+			return true, nil
+		}
+		now := a.clock.Now().UTC()
+		binding.CommandIdentities = appendIfMissing(binding.CommandIdentities, senderJID)
+		binding.CommandSecretConsumedAt = &now
+		binding.SessionUpdated = now
+		if err := a.store.UpsertChannelBinding(ctx, binding); err != nil {
+			return true, err
+		}
+		a.gateway.SendNotification(ctx, tenantID, "✓ registered as operator")
+		return true, nil
+	case !isOperator:
+		return false, nil
+	case strings.HasPrefix(lower, "add customer "):
+		customer := strings.TrimSpace(clean[len("add customer "):])
+		if err := a.AddWhatsAppCustomer(ctx, tenantID, customer); err != nil {
+			return true, err
+		}
+		a.gateway.SendNotification(ctx, tenantID, "✓ added")
+		return true, nil
+	case strings.HasPrefix(lower, "remove customer "):
+		customer := strings.TrimSpace(clean[len("remove customer "):])
+		if err := a.RemoveWhatsAppCustomer(ctx, tenantID, customer); err != nil {
+			return true, err
+		}
+		a.gateway.SendNotification(ctx, tenantID, "✓ removed")
+		return true, nil
+	case lower == "list customers":
+		customers, err := a.ListWhatsAppCustomers(ctx, tenantID)
+		if err != nil {
+			return true, err
+		}
+		if len(customers) == 0 {
+			a.gateway.SendNotification(ctx, tenantID, "No customers are allowlisted.")
+		} else {
+			a.gateway.SendNotification(ctx, tenantID, strings.Join(customers, "\n"))
+		}
+		return true, nil
+	case lower == "pause":
+		until := a.clock.Now().UTC().Add(24 * time.Hour)
+		binding.CustomerIntakePausedUntil = &until
+		binding.SessionUpdated = a.clock.Now().UTC()
+		if err := a.store.UpsertChannelBinding(ctx, binding); err != nil {
+			return true, err
+		}
+		a.gateway.SendNotification(ctx, tenantID, "✓ paused")
+		return true, nil
+	case lower == "resume":
+		binding.CustomerIntakePausedUntil = nil
+		binding.SessionUpdated = a.clock.Now().UTC()
+		if err := a.store.UpsertChannelBinding(ctx, binding); err != nil {
+			return true, err
+		}
+		a.gateway.SendNotification(ctx, tenantID, "✓ resumed")
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (a *App) routeWhatsAppCustomerMessage(ctx context.Context, tenantID string, binding domain.ChannelBinding, msg channel.InboundMessage, senderJID string, ingestChannel string) error {
+	if binding.CustomerIntakePausedUntil != nil && a.clock.Now().Before(*binding.CustomerIntakePausedUntil) {
+		_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "customer_intake_paused", "customer", senderJID, "message", msg.ProviderMessageID, nil, map[string]any{
+			"customer_identifier": senderJID,
+			"channel":             ingestChannel,
+		}, "customer-intake-paused", tenantID, ingestChannel, msg.ProviderMessageID))
+		return nil
+	}
+	_, err := a.IngestCustomerMessage(ctx, IngestionEvent{
+		TenantID:           tenantID,
+		Channel:            ingestChannel,
+		SourceMessageID:    msg.ProviderMessageID,
+		CustomerIdentifier: senderJID,
+		ReceivedAt:         msg.ReceivedAt,
+		BodyText:           msg.FreeText,
+	})
+	return err
 }
 
 // handlePromoteCommand resolves a `promote` reply by promoting the most-
@@ -492,11 +830,11 @@ func extractPacketReference(text string) string {
 // guessButtonFromText derives an action_button from a free-text reply.
 // Real operators type natural language, not "wrong action ..." prefixes, so
 // we apply a two-stage decision:
-//   1. Numeric (1..6) or short positive ack ("approve" / "ok" / "yes" / "👍")
-//      → exact button match.
-//   2. Anything else (substantive prose) → ActionWrongAction with the prose
-//      preserved as free_text. structuredRuleFromCorrection then mines the
-//      content for known patterns (singapore/no gst, photos, send anyway, etc).
+//  1. Numeric (1..6) or short positive ack ("approve" / "ok" / "yes" / "👍")
+//     → exact button match.
+//  2. Anything else (substantive prose) → ActionWrongAction with the prose
+//     preserved as free_text. structuredRuleFromCorrection then mines the
+//     content for known patterns (singapore/no gst, photos, send anyway, etc).
 //
 // This is the spec's Stage 2 (text-match) cascade per operator-ux §7.1.
 // Stage 3 (LLM-assisted) is deferred to Phase 2 per RESOLVED-OE-OU-2.
@@ -749,7 +1087,132 @@ func (a *App) persistApproval(ctx context.Context, envelope domain.ApprovalSigna
 	if err := a.store.UpdateDecisionPointStatus(ctx, envelope.TenantID, envelope.DecisionPointID, "approved"); err != nil {
 		return err
 	}
-	return a.store.UpdateCaseRunStatus(ctx, envelope.TenantID, envelope.CaseRunID, "approved")
+	if err := a.store.UpdateCaseRunStatus(ctx, envelope.TenantID, envelope.CaseRunID, "approved"); err != nil {
+		return err
+	}
+	_, sendErr := a.SendApprovedCustomerReply(ctx, envelope.TenantID, envelope.CaseRunID)
+	if errors.Is(sendErr, channel.ErrAdapterNotAvailable) || errors.Is(sendErr, channel.ErrSessionNotConnected) || errors.Is(sendErr, domain.ErrNotFound) {
+		return nil
+	}
+	return sendErr
+}
+
+func (a *App) SendApprovedCustomerReply(ctx context.Context, tenantID, caseRunID string) (domain.OutboundToCustomer, error) {
+	run, err := a.store.GetCaseRun(ctx, tenantID, caseRunID)
+	if err != nil {
+		return domain.OutboundToCustomer{}, err
+	}
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return domain.OutboundToCustomer{}, err
+	}
+	mode := domain.ParseInboundMode(string(binding.InboundMode))
+	body := draftBodyForRun(run)
+	bodyHash := domain.SHA256Key(body)
+	switch mode {
+	case domain.InboundModeReadOnly:
+		recipient := binding.DraftDeliveryJID
+		if recipient == "" {
+			recipient = binding.OperatorJID
+		}
+		if recipient == "" {
+			recipient = normalizeWhatsAppJID(binding.ProviderNumber)
+		}
+		if err := a.sendWhatsApp(ctx, binding, channel.OutboundMessage{
+			TenantID:            tenantID,
+			RecipientIdentifier: recipient,
+			PacketID:            run.DecisionPointID,
+			BodyText:            renderOperatorDraft(run, body),
+			IdempotencyKey:      domain.SHA256Key("draft-delivery", tenantID, caseRunID, bodyHash),
+		}); err != nil {
+			return domain.OutboundToCustomer{}, err
+		}
+		_, err := a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "outbound_draft_delivered_to_operator", "system", "app", "case_run", caseRunID, nil, map[string]any{
+			"body_hash": bodyHash,
+		}, "draft-delivered", tenantID, caseRunID, bodyHash))
+		return domain.OutboundToCustomer{}, err
+	case domain.InboundModeFullControl:
+		approvalID, err := a.store.ApprovalAuditID(ctx, tenantID, run.ID, run.DecisionPointID)
+		if err != nil {
+			_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "mcp_blocked_write_attempted", "system", "app", "case_run", caseRunID, nil, map[string]any{
+				"reason": "approval_required",
+			}, "mcp-blocked-customer", tenantID, caseRunID, bodyHash))
+			return domain.OutboundToCustomer{}, domain.ErrApprovalRequired
+		}
+		recipient := stringValue(run.InputPayload, "customer_identifier", "")
+		if recipient == "" {
+			return domain.OutboundToCustomer{}, domain.ErrInvalidInput
+		}
+		recipient = normalizeWhatsAppJID(recipient)
+		out := domain.OutboundToCustomer{
+			ID:                  a.ids.NewID("otc"),
+			TenantID:            tenantID,
+			CaseRunID:           caseRunID,
+			Channel:             "whatsapp_a1",
+			RecipientIdentifier: recipient,
+			BodyHash:            bodyHash,
+			MCPApprovalAuditID:  approvalID,
+			Status:              "queued",
+		}
+		created, stored, err := a.store.UpsertOutboundToCustomer(ctx, out)
+		if err != nil {
+			return domain.OutboundToCustomer{}, err
+		}
+		if !created && stored.Status == "sent" {
+			return stored, nil
+		}
+		receipt, err := a.sendWhatsAppWithReceipt(ctx, binding, channel.OutboundMessage{
+			TenantID:            tenantID,
+			RecipientIdentifier: recipient,
+			PacketID:            run.DecisionPointID,
+			BodyText:            body,
+			IdempotencyKey:      domain.SHA256Key("customer-outbound", tenantID, caseRunID, bodyHash),
+		})
+		if err != nil {
+			return out, err
+		}
+		out.ProviderMessageID = receipt.ProviderMessageID
+		sentAt := receipt.SentAt
+		if sentAt.IsZero() {
+			sentAt = a.clock.Now().UTC()
+		}
+		out.SentAt = &sentAt
+		out.Status = "sent"
+		_, out, err = a.store.UpsertOutboundToCustomer(ctx, out)
+		if err != nil {
+			return domain.OutboundToCustomer{}, err
+		}
+		_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), tenantID, "customer_outbound_sent", "system", "app", "case_run", caseRunID, map[string]any{
+			"mcp_approval_audit_id": approvalID,
+		}, map[string]any{
+			"recipient_jid":       recipient,
+			"body_hash":           bodyHash,
+			"provider_message_id": receipt.ProviderMessageID,
+		}, "customer-outbound-sent", tenantID, caseRunID, bodyHash))
+		return out, err
+	default:
+		return domain.OutboundToCustomer{}, domain.ErrInvalidInput
+	}
+}
+
+func (a *App) sendWhatsApp(ctx context.Context, binding domain.ChannelBinding, msg channel.OutboundMessage) error {
+	_, err := a.sendWhatsAppWithReceipt(ctx, binding, msg)
+	return err
+}
+
+func (a *App) sendWhatsAppWithReceipt(ctx context.Context, binding domain.ChannelBinding, msg channel.OutboundMessage) (channel.DeliveryReceipt, error) {
+	a.gateway.mu.RLock()
+	adapter := a.gateway.adapters[channel.ChannelWhatsApp]
+	a.gateway.mu.RUnlock()
+	if adapter == nil {
+		return channel.DeliveryReceipt{}, channel.ErrAdapterNotAvailable
+	}
+	if guarded, ok := adapter.(interface {
+		SendOutboundWithBinding(context.Context, domain.ChannelBinding, channel.OutboundMessage) (channel.DeliveryReceipt, error)
+	}); ok {
+		return guarded.SendOutboundWithBinding(ctx, binding, msg)
+	}
+	return adapter.SendOutbound(ctx, msg)
 }
 
 func (a *App) persistCorrection(ctx context.Context, envelope domain.ApprovalSignalEnvelope) error {
@@ -841,7 +1304,7 @@ func (a *App) mergeCandidate(ctx context.Context, correction domain.Correction) 
 				return err
 			}
 			_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, correction.TenantID, "candidate_contradiction_detected", "system", "learning", "rule_candidate", conflict.ID, map[string]any{
-				"correction_id":     correction.ID,
+				"correction_id":      correction.ID,
 				"conflicting_action": recommendedAction,
 			}, nil, "candidate-contradiction", correction.TenantID, conflict.ID, correction.ID))
 			a.gateway.SendNotification(ctx, correction.TenantID, formatContradictionAlert(conflict, recommendedAction))
@@ -1198,6 +1661,82 @@ func factsFromPayload(payload map[string]any) []domain.Fact {
 		facts = append(facts, domain.Fact{Label: key, Value: fmt.Sprint(payload[key]), Confidence: 1})
 	}
 	return facts
+}
+
+func payloadFromIngestionEvent(event IngestionEvent) map[string]any {
+	payload := map[string]any{
+		"sandbox":             true,
+		"source_channel":      event.Channel,
+		"source_message_id":   event.SourceMessageID,
+		"customer_identifier": event.CustomerIdentifier,
+		"received_at":         event.ReceivedAt.UTC().Format(time.RFC3339),
+		"body_text":           event.BodyText,
+		"message_excerpt":     excerpt(event.BodyText, 180),
+		"from":                event.CustomerIdentifier,
+	}
+	if strings.TrimSpace(event.Subject) != "" {
+		payload["subject"] = strings.TrimSpace(event.Subject)
+	}
+	if len(event.Metadata) > 0 {
+		payload["metadata"] = cloneMap(event.Metadata)
+	}
+	return payload
+}
+
+func draftBodyForRun(run domain.CaseRun) string {
+	customer := stringValue(run.InputPayload, "customer_identifier", "there")
+	switch run.WorkflowSlug {
+	case "quote_drafting":
+		return fmt.Sprintf("Hi! Thanks for reaching out. We can help with that quote, %s. Could you send 2-3 photos so we can size it correctly?", customer)
+	default:
+		body := stringValue(run.InputPayload, "body_text", "")
+		if body == "" {
+			return "Hi! Thanks for reaching out. We'll review this and get back to you shortly."
+		}
+		return "Hi! Thanks for reaching out. We'll review your message and get back to you shortly."
+	}
+}
+
+func renderOperatorDraft(run domain.CaseRun, body string) string {
+	customer := stringValue(run.InputPayload, "customer_identifier", "the customer")
+	return fmt.Sprintf("✅ Approved. Here's the draft to send to %s:\n\n──────\n%s\n──────\n\nLong-press, Forward, pick the customer's chat.", customer, body)
+}
+
+func excerpt(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return strings.TrimSpace(value[:limit])
+}
+
+func normalizeInboundJID(msg channel.InboundMessage) string {
+	if jid := normalizeWhatsAppJID(msg.SenderJID); jid != "" {
+		return jid
+	}
+	return normalizeWhatsAppJID(msg.SenderIdentifier)
+}
+
+func normalizeWhatsAppJID(input string) string {
+	clean := strings.TrimSpace(input)
+	if clean == "" {
+		return ""
+	}
+	if strings.ContainsRune(clean, '@') {
+		return clean
+	}
+	clean = strings.TrimPrefix(clean, "+")
+	return clean + "@s.whatsapp.net"
+}
+
+func removeString(values []string, target string) []string {
+	out := values[:0]
+	for _, value := range values {
+		if value != target {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func auditEvent(ids IDGenerator, now time.Time, tenantID, eventType, actorType, actorID, refType, refID string, related map[string]any, payload map[string]any, keyParts ...string) domain.AuditEvent {

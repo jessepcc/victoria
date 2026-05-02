@@ -1,10 +1,50 @@
 # Customer-Inbound Channels — Implementation Spec
 
-**Status:** Draft for R&D handoff. Targets Beta launch.
+**Status:** Partially implemented for Beta. Core P0-P7 slice landed in this repo; see implementation notes below.
 **Predecessors:** `doc/sandbox-tech-spec/` (Round 5 SHIPPABLE) — base architecture.
 **Scope:** Three customer-inbound channels (00, A0, A1-whatsmeow). A1-BSP deferred post-funding.
 
 ---
+
+## 0. Implementation status in this repo
+
+Implemented:
+
+- `App.IngestCustomerMessage(ctx, IngestionEvent)` with idempotency on
+  `(tenant_id, channel, source_message_id)`, durable `customer_messages`
+  storage, automatic `enquiry_triage` case creation, and
+  `customer_message_received` audit events.
+- Additive `ChannelBinding` fields for `inbound_mode`, command identities,
+  customer allowlist, consent, pause, retention, and draft delivery routing.
+- Additive `customer_messages` and `outbound_to_customer` persistence in both
+  memory and Postgres stores.
+- HTTP `POST /ingest/customer-message` for 00-channel adapters and demos.
+- `scripts/cases-simulator.sh` for randomized customer-message demo traffic.
+- A0 consent gate before WhatsApp pairing, allowlist API, WhatsApp allowlist
+  commands, pause/resume, sender classifier, and hard outbound guard with
+  `outbound_blocked_to_customer` audit.
+- A0 approval behavior: approved replies are delivered as draft text to the
+  operator delivery JID only; no `outbound_to_customer` row is written.
+- A1 command identity support in the binding model, customer/operator sender
+  classifier, approval-gated customer outbound, idempotent `outbound_to_customer`
+  records, and retry of queued records after provider send failure.
+- Telegram customer chat classification via `telegram_customer_chats`.
+
+Still deferred or not fully wired:
+
+- Real IMAP poller and Telegram Bot API polling/webhook adapter. The canonical
+  ingestion path and HTTP surface are ready for those adapters.
+- WhatsApp A1 repair/ban-response endpoints, heartbeat metrics, and queued
+  customer-outbound drain after repair.
+- RLS/role-grant hardening beyond the current JSONB-backed migration style.
+- Observability metric emission. Audit events are implemented; Prometheus
+  counters/gauges remain future work.
+
+Verification:
+
+- `go test ./...`
+- `test/e2e` includes HTTP coverage for customer ingestion, consent, and A0
+  allowlist management.
 
 ## 1. Product value (engineering framing)
 

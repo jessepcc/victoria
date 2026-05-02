@@ -1,8 +1,10 @@
 package whatsapp
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"victoria/internal/channel"
 	"victoria/internal/domain"
@@ -110,4 +112,74 @@ func TestSessionStatusEnumExhaustive(t *testing.T) {
 	if domain.SessionUnknown != "" {
 		t.Fatal("SessionUnknown must be empty string sentinel")
 	}
+}
+
+func TestA0OutboundGuardBlocksCustomerRecipients(t *testing.T) {
+	auditor := &captureAuditor{}
+	sender := &captureSender{}
+	guarded := NewGuardedAdapter(sender, auditor)
+	binding := domain.ChannelBinding{
+		TenantID:       "t_1",
+		Channel:        string(channel.ChannelWhatsApp),
+		ProviderNumber: "+61400000000",
+		InboundMode:    domain.InboundModeReadOnly,
+		OperatorJID:    "61400000000@s.whatsapp.net",
+	}
+
+	_, err := guarded.SendOutboundWithBinding(context.Background(), binding, channel.OutboundMessage{
+		TenantID:            "t_1",
+		RecipientIdentifier: "85299999999@s.whatsapp.net",
+		BodyText:            "must not send",
+		IdempotencyKey:      "blocked-1",
+	})
+	if err == nil {
+		t.Fatal("expected guard error for customer recipient")
+	}
+	if len(sender.sent) != 0 {
+		t.Fatalf("guarded adapter sent blocked message: %+v", sender.sent)
+	}
+	if len(auditor.events) != 1 || auditor.events[0].EventType != "outbound_blocked_to_customer" {
+		t.Fatalf("audit events = %+v, want outbound_blocked_to_customer", auditor.events)
+	}
+	if auditor.events[0].Payload["dst_jid"] != "85299999999@s.whatsapp.net" {
+		t.Fatalf("audit payload = %+v", auditor.events[0].Payload)
+	}
+
+	if _, err := guarded.SendOutboundWithBinding(context.Background(), binding, channel.OutboundMessage{
+		TenantID:            "t_1",
+		RecipientIdentifier: "61400000000@s.whatsapp.net",
+		BodyText:            "allowed to operator",
+		IdempotencyKey:      "allowed-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(sender.sent) != 1 {
+		t.Fatalf("allowed send count = %d, want 1", len(sender.sent))
+	}
+}
+
+type captureSender struct {
+	sent []channel.OutboundMessage
+}
+
+func (s *captureSender) SendOutbound(ctx context.Context, msg channel.OutboundMessage) (channel.DeliveryReceipt, error) {
+	s.sent = append(s.sent, msg)
+	return channel.DeliveryReceipt{ProviderMessageID: "wa:test", SentAt: time.Now()}, nil
+}
+
+type captureAuditor struct {
+	events []domain.AuditEvent
+}
+
+func (a *captureAuditor) RecordOutboundBlocked(ctx context.Context, tenantID, dstJID, bodyHash, callSite string) error {
+	a.events = append(a.events, domain.AuditEvent{
+		TenantID:  tenantID,
+		EventType: "outbound_blocked_to_customer",
+		Payload: map[string]any{
+			"dst_jid":         dstJID,
+			"body_hash":       bodyHash,
+			"call_site_stack": callSite,
+		},
+	})
+	return nil
 }

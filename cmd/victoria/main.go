@@ -52,6 +52,12 @@ func main() {
 				log.Printf("whatsapp session: tenant=%s status=%s jid=%s", u.TenantID, u.Status, u.JID)
 				application.NotifyChannelSession(ctx, u.TenantID, channel.ChannelWhatsApp, u.Status)
 			},
+			BindingForTenant: func(c context.Context, tenantID string) (domain.ChannelBinding, error) {
+				return application.GetChannelBinding(c, tenantID, string(channel.ChannelWhatsApp))
+			},
+			AuditOutboundBlocked: func(c context.Context, tenantID, dstJID, bodyHash, callSite string) error {
+				return application.RecordOutboundBlocked(c, tenantID, dstJID, bodyHash, callSite)
+			},
 			Inbound: func(c context.Context, tenantID string, m channel.InboundMessage) error {
 				return application.HandleWhatsAppInbound(c, tenantID, m)
 			},

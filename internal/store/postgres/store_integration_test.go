@@ -95,6 +95,8 @@ DROP TABLE IF EXISTS validated_rules;
 DROP TABLE IF EXISTS rule_candidates;
 DROP TABLE IF EXISTS corrections;
 DROP TABLE IF EXISTS signals;
+DROP TABLE IF EXISTS outbound_to_customer;
+DROP TABLE IF EXISTS customer_messages;
 DROP TABLE IF EXISTS audit_events;
 DROP TABLE IF EXISTS review_packets;
 DROP TABLE IF EXISTS artifacts;

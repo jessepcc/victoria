@@ -14,10 +14,11 @@
 #
 # This script:
 #   1. POSTs /admin/tenants → captures tenant_id
-#   2. POSTs /channel-bindings/whatsapp/init → kicks off pairing
-#   3. Saves QR PNG to /tmp/victoria-wa-qr.png and opens it
-#   4. Polls /channel-bindings/whatsapp/status until "active"
-#   5. Posts a sample case → review packet hits the paired phone
+#   2. POSTs /channel-bindings/whatsapp/consent → records read-only consent
+#   3. POSTs /channel-bindings/whatsapp/init → kicks off pairing
+#   4. Saves QR PNG to /tmp/victoria-wa-qr.png and opens it
+#   5. Polls /channel-bindings/whatsapp/status until "active"
+#   6. Posts a sample case → review packet hits the paired phone
 
 set -euo pipefail
 
@@ -39,6 +40,12 @@ TENANT_ID=$(echo "$TENANT_JSON" | python3 -c 'import json,sys;print(json.load(sy
 echo "  tenant_id=$TENANT_ID"
 
 AUTH="Authorization: Bearer tid:$TENANT_ID"
+
+echo "→ Recording WhatsApp read-only consent"
+curl -fsS -X POST "$ADDR/channel-bindings/whatsapp/consent" \
+  -H "$AUTH" \
+  -H 'Content-Type: application/json' \
+  -d "{\"inbound_mode\":\"read_only\",\"draft_delivery_jid\":\"$PROVIDER_NUMBER\"}" >/dev/null
 
 echo "→ Beginning WhatsApp pairing"
 INIT_JSON=$(curl -fsS -X POST "$ADDR/channel-bindings/whatsapp/init" -H "$AUTH" -d '{}')

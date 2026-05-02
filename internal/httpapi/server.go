@@ -46,6 +46,10 @@ func (s *Server) Handler() http.Handler {
 	r.Post("/gateway/inbound", s.gatewayInbound)
 	r.Get("/mcp/tools", s.mcpTools)
 	r.With(tenantAuth).Post("/mcp/write-final", s.mcpWriteFinal)
+	r.With(tenantAuth).Post("/ingest/customer-message", s.ingestCustomerMessage)
+	r.With(tenantAuth).Post("/channel-bindings/whatsapp/consent", s.whatsappConsent)
+	r.With(tenantAuth).Post("/channel-bindings/whatsapp/customers", s.whatsappAddCustomer)
+	r.With(tenantAuth).Delete("/channel-bindings/whatsapp/customers", s.whatsappRemoveCustomer)
 	r.With(tenantAuth).Post("/channel-bindings/whatsapp/init", s.whatsappInit)
 	r.With(tenantAuth).Get("/channel-bindings/whatsapp/qr", s.whatsappQR)
 	r.With(tenantAuth).Get("/channel-bindings/whatsapp/qr.png", s.whatsappQRPNG)
@@ -65,6 +69,10 @@ func (s *Server) whatsappInit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if binding.ConsentAcknowledgedAt == nil {
+		writeError(w, domain.ErrConsentRequired)
+		return
+	}
 	code, err := s.whatsapp.BeginPairing(r.Context(), tenantID)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "pairing_failed", "message": err.Error()})
@@ -76,6 +84,64 @@ func (s *Server) whatsappInit(w http.ResponseWriter, r *http.Request) {
 		"provider_number": binding.ProviderNumber,
 		"png_url":         "/channel-bindings/whatsapp/qr.png",
 	})
+}
+
+func (s *Server) whatsappConsent(w http.ResponseWriter, r *http.Request) {
+	var req app.AcknowledgeWhatsAppConsentInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	if err := s.app.AcknowledgeWhatsAppConsent(r.Context(), tenantID, req); err != nil {
+		writeError(w, err)
+		return
+	}
+	binding, err := s.bindingForTenant(r.Context(), tenantID, channel.ChannelWhatsApp)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"binding": binding})
+}
+
+func (s *Server) whatsappAddCustomer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Customer string `json:"customer"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	if err := s.app.AddWhatsAppCustomer(r.Context(), tenantID, req.Customer); err != nil {
+		writeError(w, err)
+		return
+	}
+	customers, err := s.app.ListWhatsAppCustomers(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"customers": customers})
+}
+
+func (s *Server) whatsappRemoveCustomer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Customer string `json:"customer"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	tenantID := tenantFromContext(r.Context())
+	if err := s.app.RemoveWhatsAppCustomer(r.Context(), tenantID, req.Customer); err != nil {
+		writeError(w, err)
+		return
+	}
+	customers, err := s.app.ListWhatsAppCustomers(r.Context(), tenantID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"customers": customers})
 }
 
 func (s *Server) whatsappQR(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +259,20 @@ func (s *Server) startCase(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"case_run": run, "review_packet": packet})
+}
+
+func (s *Server) ingestCustomerMessage(w http.ResponseWriter, r *http.Request) {
+	var req app.IngestionEvent
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.TenantID = tenantFromContext(r.Context())
+	caseRunID, err := s.app.IngestCustomerMessage(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"case_run_id": caseRunID})
 }
 
 func (s *Server) gatewayInbound(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +393,8 @@ func writeErrorWithPayload(w http.ResponseWriter, err error, payload any) {
 		status, code = http.StatusForbidden, "approval_required"
 	case errors.Is(err, domain.ErrExpired):
 		status, code = http.StatusGone, "expired"
+	case errors.Is(err, domain.ErrConsentRequired):
+		status, code = http.StatusForbidden, "consent_required"
 	}
 	body := map[string]any{"error": code, "message": err.Error()}
 	if payload != nil {

@@ -47,11 +47,13 @@ type DeliveryReceipt struct {
 
 type InboundMessage struct {
 	SenderIdentifier  string
+	SenderJID         string
 	ProviderMessageID string
 	Channel           Channel
 	ButtonPayload     string
 	FreeText          string
 	ReceivedAt        time.Time
+	IsFromMe          bool
 }
 
 var (
@@ -79,10 +81,10 @@ func RenderPacket(packet domain.ReviewPacket, recipient string) OutboundMessage 
 
 // renderBody narrates the packet in a first-person, workflow-aware tone. The
 // goal is that an operator reading the message understands:
-//   1. who/what came in,
-//   2. what Victoria sees about it,
-//   3. what Victoria is planning to do, and
-//   4. how to respond (tap or natural-language reply).
+//  1. who/what came in,
+//  2. what Victoria sees about it,
+//  3. what Victoria is planning to do, and
+//  4. how to respond (tap or natural-language reply).
 func renderBody(p domain.ReviewPacket) string {
 	facts := factsToMap(p.Facts)
 	switch p.WorkflowType {

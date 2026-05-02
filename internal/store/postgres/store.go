@@ -61,6 +61,13 @@ CREATE TABLE IF NOT EXISTS channel_bindings (
 );
 CREATE INDEX IF NOT EXISTS channel_bindings_tenant_idx ON channel_bindings (tenant_id);
 CREATE INDEX IF NOT EXISTS channel_bindings_channel_idx ON channel_bindings (channel);
+ALTER TABLE channel_bindings ADD COLUMN IF NOT EXISTS inbound_mode TEXT NOT NULL DEFAULT 'read_only';
+ALTER TABLE channel_bindings ADD COLUMN IF NOT EXISTS command_identities JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE channel_bindings ADD COLUMN IF NOT EXISTS customer_allowlist JSONB NOT NULL DEFAULT '[]';
+ALTER TABLE channel_bindings ADD COLUMN IF NOT EXISTS consent_acknowledged_at TIMESTAMPTZ;
+ALTER TABLE channel_bindings ADD COLUMN IF NOT EXISTS customer_intake_paused_until TIMESTAMPTZ;
+ALTER TABLE channel_bindings ADD COLUMN IF NOT EXISTS retention_minutes INT NOT NULL DEFAULT 30;
+ALTER TABLE channel_bindings ADD COLUMN IF NOT EXISTS draft_delivery_jid TEXT;
 CREATE TABLE IF NOT EXISTS outbound_queue (
 	id TEXT PRIMARY KEY,
 	tenant_id TEXT NOT NULL,
@@ -110,6 +117,35 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS audit_events_tenant_idx ON audit_events (tenant_id, occurred_at);
 CREATE INDEX IF NOT EXISTS audit_events_approval_idx ON audit_events (tenant_id, event_type, ref_id);
+CREATE TABLE IF NOT EXISTS customer_messages (
+	id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL,
+	channel TEXT NOT NULL,
+	source_message_id TEXT NOT NULL,
+	customer_identifier TEXT NOT NULL,
+	received_at TIMESTAMPTZ NOT NULL,
+	case_run_id TEXT NOT NULL DEFAULT '',
+	status TEXT NOT NULL DEFAULT 'ingested',
+	data JSONB NOT NULL,
+	UNIQUE (tenant_id, channel, source_message_id)
+);
+CREATE INDEX IF NOT EXISTS customer_messages_tenant_idx ON customer_messages (tenant_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS customer_messages_case_idx ON customer_messages (case_run_id);
+CREATE TABLE IF NOT EXISTS outbound_to_customer (
+	id TEXT PRIMARY KEY,
+	tenant_id TEXT NOT NULL,
+	case_run_id TEXT NOT NULL,
+	channel TEXT NOT NULL,
+	recipient_identifier TEXT NOT NULL,
+	body_hash TEXT NOT NULL,
+	mcp_approval_audit_id TEXT NOT NULL,
+	provider_message_id TEXT NOT NULL DEFAULT '',
+	sent_at TIMESTAMPTZ,
+	status TEXT NOT NULL DEFAULT 'queued',
+	data JSONB NOT NULL,
+	UNIQUE (tenant_id, case_run_id, body_hash)
+);
+CREATE INDEX IF NOT EXISTS outbound_to_customer_tenant_idx ON outbound_to_customer (tenant_id, sent_at DESC);
 CREATE OR REPLACE FUNCTION victoria_reject_audit_events_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -446,6 +482,101 @@ func (s *Store) HasApprovalAudit(ctx context.Context, tenantID, caseRunID, decis
 		WHERE tenant_id=$1 AND event_type='approval_received' AND ref_id=$2 AND data->'related_ids'->>'case_run_id'=$3
 	)`, tenantID, decisionPointID, caseRunID).Scan(&exists)
 	return exists, err
+}
+
+func (s *Store) ApprovalAuditID(ctx context.Context, tenantID, caseRunID, decisionPointID string) (string, error) {
+	var id string
+	err := s.pool.QueryRow(ctx,
+		`SELECT id FROM audit_events
+		 WHERE tenant_id=$1 AND event_type='approval_received' AND ref_id=$2 AND data->'related_ids'->>'case_run_id'=$3
+		 ORDER BY occurred_at, id LIMIT 1`,
+		tenantID, decisionPointID, caseRunID,
+	).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", domain.ErrNotFound
+		}
+		return "", err
+	}
+	return id, nil
+}
+
+func (s *Store) CreateCustomerMessage(ctx context.Context, msg domain.CustomerMessage) (bool, domain.CustomerMessage, error) {
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO customer_messages (id, tenant_id, channel, source_message_id, customer_identifier, received_at, case_run_id, status, data)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		 ON CONFLICT (tenant_id, channel, source_message_id) DO NOTHING`,
+		msg.ID, msg.TenantID, msg.Channel, msg.SourceMessageID, msg.CustomerIdentifier, msg.ReceivedAt, msg.CaseRunID, msg.Status, mustJSON(msg),
+	)
+	if err != nil {
+		return false, domain.CustomerMessage{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		existing, err := s.CustomerMessageBySource(ctx, msg.TenantID, msg.Channel, msg.SourceMessageID)
+		return false, existing, err
+	}
+	return true, msg, nil
+}
+
+func (s *Store) CustomerMessageBySource(ctx context.Context, tenantID, channel, sourceMessageID string) (domain.CustomerMessage, error) {
+	return oneJSON[domain.CustomerMessage](ctx, s.pool, `SELECT data FROM customer_messages WHERE tenant_id=$1 AND channel=$2 AND source_message_id=$3`, tenantID, channel, sourceMessageID)
+}
+
+func (s *Store) UpdateCustomerMessageCase(ctx context.Context, tenantID, channel, sourceMessageID, caseRunID, status string) error {
+	msg, err := s.CustomerMessageBySource(ctx, tenantID, channel, sourceMessageID)
+	if err != nil {
+		return err
+	}
+	msg.CaseRunID = caseRunID
+	msg.Status = status
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE customer_messages SET case_run_id=$1, status=$2, data=$3 WHERE tenant_id=$4 AND channel=$5 AND source_message_id=$6`,
+		caseRunID, status, mustJSON(msg), tenantID, channel, sourceMessageID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpsertOutboundToCustomer(ctx context.Context, out domain.OutboundToCustomer) (bool, domain.OutboundToCustomer, error) {
+	tag, err := s.pool.Exec(ctx,
+		`INSERT INTO outbound_to_customer (id, tenant_id, case_run_id, channel, recipient_identifier, body_hash, mcp_approval_audit_id, provider_message_id, sent_at, status, data)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		 ON CONFLICT (tenant_id, case_run_id, body_hash) DO NOTHING`,
+		out.ID, out.TenantID, out.CaseRunID, out.Channel, out.RecipientIdentifier, out.BodyHash, out.MCPApprovalAuditID, out.ProviderMessageID, out.SentAt, out.Status, mustJSON(out),
+	)
+	if err != nil {
+		return false, domain.OutboundToCustomer{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		existing, err := s.OutboundToCustomerByCaseAndHash(ctx, out.TenantID, out.CaseRunID, out.BodyHash)
+		if err == nil && existing.Status != "sent" && out.Status == "sent" {
+			out.ID = existing.ID
+			updateTag, updateErr := s.pool.Exec(ctx,
+				`UPDATE outbound_to_customer
+				 SET provider_message_id=$1, sent_at=$2, status=$3, data=$4
+				 WHERE tenant_id=$5 AND case_run_id=$6 AND body_hash=$7`,
+				out.ProviderMessageID, out.SentAt, out.Status, mustJSON(out), out.TenantID, out.CaseRunID, out.BodyHash,
+			)
+			if updateErr != nil {
+				return false, domain.OutboundToCustomer{}, updateErr
+			}
+			if updateTag.RowsAffected() == 0 {
+				return false, domain.OutboundToCustomer{}, domain.ErrNotFound
+			}
+			return false, out, nil
+		}
+		return false, existing, err
+	}
+	return true, out, nil
+}
+
+func (s *Store) OutboundToCustomerByCaseAndHash(ctx context.Context, tenantID, caseRunID, bodyHash string) (domain.OutboundToCustomer, error) {
+	return oneJSON[domain.OutboundToCustomer](ctx, s.pool, `SELECT data FROM outbound_to_customer WHERE tenant_id=$1 AND case_run_id=$2 AND body_hash=$3`, tenantID, caseRunID, bodyHash)
 }
 
 func (s *Store) SeenSignal(ctx context.Context, signalID string) (bool, error) {

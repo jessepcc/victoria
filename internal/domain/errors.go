@@ -13,4 +13,5 @@ var (
 	ErrCapabilityDenied     = errors.New("capability denied")
 	ErrSecurityViolation    = errors.New("security violation")
 	ErrExpired              = errors.New("expired")
+	ErrConsentRequired      = errors.New("consent required")
 )

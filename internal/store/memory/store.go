@@ -22,6 +22,10 @@ type Store struct {
 	packets       map[string]domain.ReviewPacket
 	auditEvents   map[string]domain.AuditEvent
 	auditByKey    map[string]string
+	customerMsgs  map[string]domain.CustomerMessage
+	customerByKey map[string]string
+	customerOut   map[string]domain.OutboundToCustomer
+	outByKey      map[string]string
 	signals       map[string]struct{}
 	corrections   map[string]domain.Correction
 	correctionKey map[string]string
@@ -44,6 +48,10 @@ func New() *Store {
 		packets:       map[string]domain.ReviewPacket{},
 		auditEvents:   map[string]domain.AuditEvent{},
 		auditByKey:    map[string]string{},
+		customerMsgs:  map[string]domain.CustomerMessage{},
+		customerByKey: map[string]string{},
+		customerOut:   map[string]domain.OutboundToCustomer{},
+		outByKey:      map[string]string{},
 		signals:       map[string]struct{}{},
 		corrections:   map[string]domain.Correction{},
 		correctionKey: map[string]string{},
@@ -393,6 +401,83 @@ func (s *Store) HasApprovalAudit(_ context.Context, tenantID, caseRunID, decisio
 	return false, nil
 }
 
+func (s *Store) ApprovalAuditID(_ context.Context, tenantID, caseRunID, decisionPointID string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, event := range s.auditEvents {
+		if event.TenantID == tenantID && event.EventType == "approval_received" && event.RefID == decisionPointID {
+			if event.RelatedIDs["case_run_id"] == caseRunID {
+				return event.ID, nil
+			}
+		}
+	}
+	return "", domain.ErrNotFound
+}
+
+func (s *Store) CreateCustomerMessage(_ context.Context, msg domain.CustomerMessage) (bool, domain.CustomerMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := customerMessageKey(msg.TenantID, msg.Channel, msg.SourceMessageID)
+	if id, ok := s.customerByKey[key]; ok {
+		return false, cloneCustomerMessage(s.customerMsgs[id]), nil
+	}
+	s.customerMsgs[msg.ID] = cloneCustomerMessage(msg)
+	s.customerByKey[key] = msg.ID
+	return true, cloneCustomerMessage(msg), nil
+}
+
+func (s *Store) CustomerMessageBySource(_ context.Context, tenantID, channel, sourceMessageID string) (domain.CustomerMessage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.customerByKey[customerMessageKey(tenantID, channel, sourceMessageID)]
+	if !ok {
+		return domain.CustomerMessage{}, domain.ErrNotFound
+	}
+	return cloneCustomerMessage(s.customerMsgs[id]), nil
+}
+
+func (s *Store) UpdateCustomerMessageCase(_ context.Context, tenantID, channel, sourceMessageID, caseRunID, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.customerByKey[customerMessageKey(tenantID, channel, sourceMessageID)]
+	if !ok {
+		return domain.ErrNotFound
+	}
+	msg := s.customerMsgs[id]
+	msg.CaseRunID = caseRunID
+	msg.Status = status
+	s.customerMsgs[id] = cloneCustomerMessage(msg)
+	return nil
+}
+
+func (s *Store) UpsertOutboundToCustomer(_ context.Context, out domain.OutboundToCustomer) (bool, domain.OutboundToCustomer, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := outboundCustomerKey(out.TenantID, out.CaseRunID, out.BodyHash)
+	if id, ok := s.outByKey[key]; ok {
+		existing := s.customerOut[id]
+		if existing.Status != "sent" && out.Status == "sent" {
+			out.ID = existing.ID
+			s.customerOut[id] = cloneOutboundToCustomer(out)
+			return false, cloneOutboundToCustomer(out), nil
+		}
+		return false, cloneOutboundToCustomer(existing), nil
+	}
+	s.customerOut[out.ID] = cloneOutboundToCustomer(out)
+	s.outByKey[key] = out.ID
+	return true, cloneOutboundToCustomer(out), nil
+}
+
+func (s *Store) OutboundToCustomerByCaseAndHash(_ context.Context, tenantID, caseRunID, bodyHash string) (domain.OutboundToCustomer, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.outByKey[outboundCustomerKey(tenantID, caseRunID, bodyHash)]
+	if !ok {
+		return domain.OutboundToCustomer{}, domain.ErrNotFound
+	}
+	return cloneOutboundToCustomer(s.customerOut[id]), nil
+}
+
 func (s *Store) SeenSignal(_ context.Context, signalID string) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -603,6 +688,14 @@ func bindingKey(channel, providerNumber string) string {
 	return channel + "\x00" + providerNumber
 }
 
+func customerMessageKey(tenantID, channel, sourceMessageID string) string {
+	return tenantID + "\x00" + channel + "\x00" + sourceMessageID
+}
+
+func outboundCustomerKey(tenantID, caseRunID, bodyHash string) string {
+	return tenantID + "\x00" + caseRunID + "\x00" + bodyHash
+}
+
 func svKey(tenantID, workflowSlug string) string {
 	return tenantID + "\x00" + workflowSlug
 }
@@ -638,6 +731,19 @@ func cloneArtifact(in domain.Artifact) domain.Artifact {
 func cloneAuditEvent(in domain.AuditEvent) domain.AuditEvent {
 	in.RelatedIDs = cloneMap(in.RelatedIDs)
 	in.Payload = cloneMap(in.Payload)
+	return in
+}
+
+func cloneCustomerMessage(in domain.CustomerMessage) domain.CustomerMessage {
+	in.Metadata = cloneMap(in.Metadata)
+	return in
+}
+
+func cloneOutboundToCustomer(in domain.OutboundToCustomer) domain.OutboundToCustomer {
+	if in.SentAt != nil {
+		t := *in.SentAt
+		in.SentAt = &t
+	}
 	return in
 }
 

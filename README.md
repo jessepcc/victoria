@@ -42,13 +42,16 @@ VICTORIA_TEST_DATABASE_URL='postgres://user:pass@localhost:5432/victoria_test?ss
 
 - `POST /admin/tenants` provisions a tenant, channel binding, workflow templates, and initial `SkillVersion`.
 - `POST /cases` starts a sandbox/live case for the authenticated tenant. Tenant context comes only from `Authorization: Bearer tid:<tenant_id>`.
+- `POST /ingest/customer-message` accepts canonical customer messages from 00-channel adapters and idempotently creates an `enquiry_triage` case.
 - `POST /gateway/inbound` accepts a resolved operator reply and emits the 16-field approval signal envelope.
 - `GET /candidates` lists rule candidates for the authenticated tenant.
 - `POST /admin/candidates/{tenant_id}/{candidate_id}/promote` promotes a candidate and creates a new immutable `SkillVersion`.
 - `POST /admin/replays` replays a case with pinned or current skill version.
 - `GET /mcp/tools?mode=sandbox|live` returns the effective MCP tool manifest.
 - `POST /mcp/write-final` exercises the MCP three-gate preflight: tenant binding, sandbox mode, approval audit.
-- `POST /channel-bindings/whatsapp/init` starts a fresh whatsmeow pairing for the authenticated tenant; `GET /channel-bindings/whatsapp/qr.png` returns a renderable QR. See [doc/whatsapp-setup.md](doc/whatsapp-setup.md).
+- `POST /channel-bindings/whatsapp/consent` records required WhatsApp consent and mode before pairing.
+- `POST` / `DELETE /channel-bindings/whatsapp/customers` manage the A0 customer JID allowlist.
+- `POST /channel-bindings/whatsapp/init` starts a fresh whatsmeow pairing after consent; `GET /channel-bindings/whatsapp/qr.png` returns a renderable QR. See [doc/whatsapp-setup.md](doc/whatsapp-setup.md).
 
 The Hermes, Temporal, and MCP sidecars are still local adapters. WhatsApp is now a real adapter built on `go.mau.fi/whatsmeow` (operator-ux spec §4.1–4.7) — bring it up by setting `VICTORIA_DATABASE_URL` and following the runbook in [doc/whatsapp-setup.md](doc/whatsapp-setup.md). To skip whatsmeow entirely (e.g., when running CI without Postgres), set `VICTORIA_WHATSAPP_DISABLED=1`.
 
@@ -68,6 +71,7 @@ A1-BSP (WhatsApp Business API) is post-funding scope.
 
 Three end-to-end storyline scripts under `scripts/` (run after pairing a tenant via `whatsapp-pair.sh`):
 
+- `cases-simulator.sh` — posts randomized customer enquiries to `/ingest/customer-message` every N seconds.
 - `showcase-1-teach-by-example.sh` — operator teaches Victoria a new business rule in 5 WhatsApp messages
 - `showcase-2-rules-generalize.sh` — three Singapore corrections produce a rule that also handles US suppliers correctly
 - `showcase-3-conflict-detection.sh` — Victoria detects contradicting operator corrections and surfaces them for senior review

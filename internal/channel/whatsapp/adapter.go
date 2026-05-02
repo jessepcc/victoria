@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -61,6 +62,12 @@ type Config struct {
 	OnSession func(SessionUpdate)
 	// Inbound is called whenever an inbound message arrives.
 	Inbound InboundDispatch
+	// BindingForTenant lets SendOutbound enforce tenant binding policy such
+	// as the A0 read-only outbound guard.
+	BindingForTenant func(ctx context.Context, tenantID string) (domain.ChannelBinding, error)
+	// AuditOutboundBlocked records hard guard refusals. It is intentionally
+	// synchronous so a refused send and its audit event stay coupled.
+	AuditOutboundBlocked func(ctx context.Context, tenantID, dstJID, bodyHash, callSite string) error
 	// Logger is whatsmeow's logger. Pass waLog.Noop in tests.
 	Logger waLog.Logger
 }
@@ -78,6 +85,35 @@ type Manager struct {
 
 	mu      sync.Mutex
 	clients map[string]*tenantClient // keyed by tenant_id
+}
+
+type OutboundSender interface {
+	SendOutbound(ctx context.Context, msg channel.OutboundMessage) (channel.DeliveryReceipt, error)
+}
+
+type OutboundBlockAuditor interface {
+	RecordOutboundBlocked(ctx context.Context, tenantID, dstJID, bodyHash, callSite string) error
+}
+
+type GuardedAdapter struct {
+	sender  OutboundSender
+	auditor OutboundBlockAuditor
+}
+
+func NewGuardedAdapter(sender OutboundSender, auditor OutboundBlockAuditor) *GuardedAdapter {
+	return &GuardedAdapter{sender: sender, auditor: auditor}
+}
+
+func (g *GuardedAdapter) SendOutboundWithBinding(ctx context.Context, binding domain.ChannelBinding, msg channel.OutboundMessage) (channel.DeliveryReceipt, error) {
+	if err := enforceA0OutboundGuard(ctx, binding, msg.RecipientIdentifier, msg.BodyText, func(ctx context.Context, tenantID, dstJID, bodyHash, callSite string) error {
+		if g.auditor == nil {
+			return nil
+		}
+		return g.auditor.RecordOutboundBlocked(ctx, tenantID, dstJID, bodyHash, callSite)
+	}); err != nil {
+		return channel.DeliveryReceipt{}, err
+	}
+	return g.sender.SendOutbound(ctx, msg)
 }
 
 // tenantClient encapsulates one tenant's whatsmeow session.
@@ -165,6 +201,15 @@ func (m *Manager) SendOutbound(ctx context.Context, msg channel.OutboundMessage)
 			return channel.DeliveryReceipt{}, fmt.Errorf("whatsapp: bad recipient: %w", err)
 		}
 		to = jid
+	}
+	if m.cfg.BindingForTenant != nil {
+		binding, err := m.cfg.BindingForTenant(ctx, msg.TenantID)
+		if err != nil {
+			return channel.DeliveryReceipt{}, err
+		}
+		if err := enforceA0OutboundGuard(ctx, binding, to.String(), msg.BodyText, m.cfg.AuditOutboundBlocked); err != nil {
+			return channel.DeliveryReceipt{}, err
+		}
 	}
 	// WhatsApp's self-chat ("Message Yourself") silently drops interactive
 	// List Messages. When the recipient is our own account JID, downgrade to
@@ -455,11 +500,13 @@ func (tc *tenantClient) dispatchInbound(evt *events.Message) {
 	tc.manager.cfg.Logger.Infof("inbound from tenant=%s sender=%s text=%q button=%q", tc.tenantID, evt.Info.Sender, body, buttonID)
 	in := channel.InboundMessage{
 		SenderIdentifier:  evt.Info.Sender.User,
+		SenderJID:         evt.Info.Sender.String(),
 		ProviderMessageID: evt.Info.ID,
 		Channel:           channel.ChannelWhatsApp,
 		ButtonPayload:     buttonID,
 		FreeText:          body,
 		ReceivedAt:        evt.Info.Timestamp,
+		IsFromMe:          evt.Info.IsFromMe,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -507,6 +554,37 @@ func parseJID(input string) (types.JID, error) {
 	}
 	clean = strings.TrimPrefix(clean, "+")
 	return types.NewJID(clean, types.DefaultUserServer), nil
+}
+
+func normalizeJIDString(input string) string {
+	clean := strings.TrimSpace(input)
+	if clean == "" {
+		return ""
+	}
+	if strings.ContainsRune(clean, '@') {
+		return clean
+	}
+	clean = strings.TrimPrefix(clean, "+")
+	return clean + "@" + types.DefaultUserServer
+}
+
+func enforceA0OutboundGuard(ctx context.Context, binding domain.ChannelBinding, recipient, body string, audit func(context.Context, string, string, string, string) error) error {
+	if binding.InboundMode != domain.InboundModeReadOnly {
+		return nil
+	}
+	dst := normalizeJIDString(recipient)
+	operator := normalizeJIDString(binding.OperatorJID)
+	if operator == "" {
+		operator = normalizeJIDString(binding.ProviderNumber)
+	}
+	if dst == "" || operator == "" || dst == operator {
+		return nil
+	}
+	bodyHash := domain.SHA256Key(body)
+	if audit != nil {
+		_ = audit(ctx, binding.TenantID, dst, bodyHash, string(debug.Stack()))
+	}
+	return fmt.Errorf("whatsapp: outbound blocked to customer in read_only mode")
 }
 
 func pickDevice(devices []*store.Device, providerNumber string) *store.Device {
