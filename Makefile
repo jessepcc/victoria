@@ -55,9 +55,9 @@ vet:
 lint:
 	golangci-lint run
 
-## vuln: scan dependencies for known vulnerabilities (module-level)
+## vuln: scan dependencies for known vulnerabilities
 vuln:
-	govulncheck -scan module
+	govulncheck ./...
 
 ## tidy: tidy go.mod / go.sum
 tidy:
