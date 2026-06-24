@@ -199,3 +199,33 @@ func (a *captureAuditor) RecordOutboundBlocked(ctx context.Context, tenantID, ds
 	})
 	return nil
 }
+
+// TestSentIDsBoundedMembership covers the echo-filter set: membership, bounded
+// eviction (so it can't grow without limit), and that empty IDs never match.
+func TestSentIDsBoundedMembership(t *testing.T) {
+	s := newSentIDs(3)
+	if s.has("a") {
+		t.Fatal("empty set should not contain 'a'")
+	}
+	s.add("a")
+	s.add("b")
+	s.add("c")
+	for _, id := range []string{"a", "b", "c"} {
+		if !s.has(id) {
+			t.Fatalf("set should contain %q", id)
+		}
+	}
+	// A 4th entry evicts the oldest ('a') — the ring holds at most 3.
+	s.add("d")
+	if s.has("a") {
+		t.Fatal("oldest entry 'a' should have been evicted")
+	}
+	if !s.has("b") || !s.has("c") || !s.has("d") {
+		t.Fatal("b, c, d should all be present after evicting a")
+	}
+	// Empty IDs are ignored on both add and has.
+	s.add("")
+	if s.has("") {
+		t.Fatal("empty id must never be a member")
+	}
+}

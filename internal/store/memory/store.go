@@ -658,10 +658,10 @@ func (s *Store) CreateSkillVersion(_ context.Context, sv domain.SkillVersion) er
 func (s *Store) ActiveSkillVersion(_ context.Context, tenantID, workflowSlug string) (domain.SkillVersion, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Exact (tenant, workflow) lookup — no fallback and no WorkflowSlug rewrite,
+	// matching the Postgres store. Provisioning creates an active SkillVersion
+	// for every default workflow, so a real workflow always resolves directly.
 	id, ok := s.activeSV[svKey(tenantID, workflowSlug)]
-	if !ok && workflowSlug != "quote_drafting" {
-		id, ok = s.activeSV[svKey(tenantID, "quote_drafting")]
-	}
 	if !ok {
 		return domain.SkillVersion{}, domain.ErrNotFound
 	}
@@ -669,9 +669,7 @@ func (s *Store) ActiveSkillVersion(_ context.Context, tenantID, workflowSlug str
 	if !ok {
 		return domain.SkillVersion{}, domain.ErrNotFound
 	}
-	out := cloneSkillVersion(sv)
-	out.WorkflowSlug = workflowSlug
-	return out, nil
+	return cloneSkillVersion(sv), nil
 }
 
 func (s *Store) GetSkillVersion(_ context.Context, tenantID, skillVersionID string) (domain.SkillVersion, error) {

@@ -132,6 +132,54 @@ type tenantClient struct {
 	// recipient where outbound packets are sent. When empty we default to the
 	// device's own account JID (self-chat).
 	recipient types.JID
+
+	// recentSent records the IDs of messages we just sent, so their echoes
+	// (A0 self-chat delivers our own sends back as inbound events) can be
+	// filtered by ID rather than by inspecting the operator-visible body.
+	recentSent *sentIDs
+}
+
+// sentIDs is a bounded, concurrency-safe set of recently-sent message IDs. It
+// backs echo detection: an inbound event whose ID we just sent is our own
+// message coming back, even for plain-text self-chat where no packet tag can be
+// embedded in the (operator-visible) body.
+type sentIDs struct {
+	mu    sync.Mutex
+	ring  []string
+	idx   int
+	set   map[string]struct{}
+	limit int
+}
+
+func newSentIDs(limit int) *sentIDs {
+	return &sentIDs{ring: make([]string, limit), set: make(map[string]struct{}, limit), limit: limit}
+}
+
+func (s *sentIDs) add(id string) {
+	if id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.set[id]; ok {
+		return
+	}
+	if evicted := s.ring[s.idx]; evicted != "" {
+		delete(s.set, evicted)
+	}
+	s.ring[s.idx] = id
+	s.set[id] = struct{}{}
+	s.idx = (s.idx + 1) % s.limit
+}
+
+func (s *sentIDs) has(id string) bool {
+	if id == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.set[id]
+	return ok
 }
 
 // New builds a Manager and brings up the shared whatsmeow Container. Caller
@@ -229,6 +277,8 @@ func (m *Manager) SendOutbound(ctx context.Context, msg channel.OutboundMessage)
 	if err != nil {
 		return channel.DeliveryReceipt{}, fmt.Errorf("whatsapp: send: %w", err)
 	}
+	// Remember the ID so the self-chat echo of this send is filtered on inbound.
+	tc.recentSent.add(resp.ID)
 	return channel.DeliveryReceipt{ProviderMessageID: resp.ID, SentAt: resp.Timestamp}, nil
 }
 
@@ -272,6 +322,7 @@ func (m *Manager) BeginPairing(ctx context.Context, tenantID string) (string, er
 		status:      domain.SessionQRNeeded,
 		pairingDone: make(chan struct{}),
 		pairing:     true,
+		recentSent:  newSentIDs(64),
 	}
 	tc.cli = whatsmeow.NewClient(device, m.cfg.Logger)
 	tc.cli.AddEventHandler(tc.handleEvent)
@@ -430,6 +481,7 @@ func (m *Manager) Restore(ctx context.Context, bindings []domain.ChannelBinding)
 			status:      domain.SessionConnecting,
 			pairingDone: closedChan(),
 			recipient:   *dev.ID,
+			recentSent:  newSentIDs(64),
 		}
 		tc.cli = whatsmeow.NewClient(dev, m.cfg.Logger)
 		tc.cli.AddEventHandler(tc.handleEvent)
@@ -515,11 +567,12 @@ func (tc *tenantClient) dispatchInbound(evt *events.Message) {
 	}
 	body := extractText(evt.Message)
 	buttonID := extractButtonReply(evt.Message)
-	// Skip true echoes of our own outbound. Self-chat (same WhatsApp account
-	// across linked devices) means operator replies arrive with IsFromMe=true,
-	// so we can't filter on that flag alone — filter on the packet tag we
-	// embed in every outbound payload.
-	if evt.Info.IsFromMe && strings.Contains(body, "[packet:") {
+	// Skip echoes of our own outbound. In A0 the operator shares their WhatsApp
+	// account, so our sends arrive back as inbound events with IsFromMe=true.
+	// Primary signal: the message ID we recorded when sending (works for
+	// plain-text self-chat where no packet tag is embedded). Fallback: the
+	// packet tag carried in rich outbound bodies.
+	if tc.recentSent.has(evt.Info.ID) || (evt.Info.IsFromMe && strings.Contains(body, "[packet:")) {
 		tc.manager.cfg.Logger.Debugf("skipping outbound echo for tenant %s msg=%s", tc.tenantID, evt.Info.ID)
 		return
 	}

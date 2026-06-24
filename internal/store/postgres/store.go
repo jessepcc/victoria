@@ -45,6 +45,22 @@ func (s *Store) Close() {
 // whatsmeow's session tables). The pool's lifetime is owned by the Store.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
+// inTx runs fn inside a transaction, committing on success and rolling back on
+// error. Read-modify-write update paths use it together with
+// SELECT ... FOR UPDATE so a concurrent writer cannot slip between the read and
+// the write (lost update / TOCTOU).
+func (s *Store) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op after Commit; rolls back on early return
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func (s *Store) Migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 CREATE TABLE IF NOT EXISTS tenants (
@@ -290,23 +306,19 @@ func (s *Store) ChannelBindingByTenant(ctx context.Context, tenantID, channel st
 }
 
 func (s *Store) UpdateChannelSessionStatus(ctx context.Context, tenantID, channel string, status domain.SessionStatus) error {
-	binding, err := s.ChannelBindingByTenant(ctx, tenantID, channel)
-	if err != nil {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		binding, err := oneJSON[domain.ChannelBinding](ctx, tx,
+			`SELECT data FROM channel_bindings WHERE tenant_id=$1 AND channel=$2 FOR UPDATE`, tenantID, channel)
+		if err != nil {
+			return err
+		}
+		binding.SessionStatus = status
+		binding.SessionUpdated = time.Now().UTC()
+		_, err = tx.Exec(ctx,
+			`UPDATE channel_bindings SET session_status=$1, session_updated_at=$2, data=$3 WHERE tenant_id=$4 AND channel=$5`,
+			string(status), binding.SessionUpdated, mustJSON(binding), tenantID, channel)
 		return err
-	}
-	binding.SessionStatus = status
-	binding.SessionUpdated = time.Now().UTC()
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE channel_bindings SET session_status=$1, session_updated_at=$2, data=$3 WHERE tenant_id=$4 AND channel=$5`,
-		string(status), binding.SessionUpdated, mustJSON(binding), tenantID, channel,
-	)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	})
 }
 
 func (s *Store) ListChannelBindingsByChannel(ctx context.Context, channel string) ([]domain.ChannelBinding, error) {
@@ -381,19 +393,16 @@ func (s *Store) CreateCaseRun(ctx context.Context, run domain.CaseRun) error {
 }
 
 func (s *Store) UpdateCaseRunStatus(ctx context.Context, tenantID, caseRunID, status string) error {
-	run, err := s.GetCaseRun(ctx, tenantID, caseRunID)
-	if err != nil {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		run, err := oneJSON[domain.CaseRun](ctx, tx,
+			`SELECT data FROM case_runs WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, caseRunID, tenantID)
+		if err != nil {
+			return err
+		}
+		run.Status = status
+		_, err = tx.Exec(ctx, `UPDATE case_runs SET data=$1 WHERE id=$2 AND tenant_id=$3`, mustJSON(run), caseRunID, tenantID)
 		return err
-	}
-	run.Status = status
-	tag, err := s.pool.Exec(ctx, `UPDATE case_runs SET data=$1 WHERE id=$2 AND tenant_id=$3`, mustJSON(run), caseRunID, tenantID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	})
 }
 
 func (s *Store) GetCaseRun(ctx context.Context, tenantID, caseRunID string) (domain.CaseRun, error) {
@@ -406,19 +415,16 @@ func (s *Store) CreateDecisionPoint(ctx context.Context, point domain.DecisionPo
 }
 
 func (s *Store) UpdateDecisionPointStatus(ctx context.Context, tenantID, decisionPointID, status string) error {
-	point, err := s.GetDecisionPoint(ctx, tenantID, decisionPointID)
-	if err != nil {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		point, err := oneJSON[domain.DecisionPoint](ctx, tx,
+			`SELECT data FROM decision_points WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, decisionPointID, tenantID)
+		if err != nil {
+			return err
+		}
+		point.Status = status
+		_, err = tx.Exec(ctx, `UPDATE decision_points SET data=$1 WHERE id=$2 AND tenant_id=$3`, mustJSON(point), decisionPointID, tenantID)
 		return err
-	}
-	point.Status = status
-	tag, err := s.pool.Exec(ctx, `UPDATE decision_points SET data=$1 WHERE id=$2 AND tenant_id=$3`, mustJSON(point), decisionPointID, tenantID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	})
 }
 
 func (s *Store) GetDecisionPoint(ctx context.Context, tenantID, decisionPointID string) (domain.DecisionPoint, error) {
@@ -450,19 +456,16 @@ func (s *Store) LatestReviewPacket(ctx context.Context, tenantID string) (domain
 }
 
 func (s *Store) MarkReviewPacketDelivered(ctx context.Context, tenantID, packetID string) error {
-	packet, err := s.GetReviewPacket(ctx, tenantID, packetID)
-	if err != nil {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		packet, err := oneJSON[domain.ReviewPacket](ctx, tx,
+			`SELECT data FROM review_packets WHERE id=$1 AND tenant_id=$2 FOR UPDATE`, packetID, tenantID)
+		if err != nil {
+			return err
+		}
+		packet.Delivered = true
+		_, err = tx.Exec(ctx, `UPDATE review_packets SET data=$1 WHERE id=$2 AND tenant_id=$3`, mustJSON(packet), packetID, tenantID)
 		return err
-	}
-	packet.Delivered = true
-	tag, err := s.pool.Exec(ctx, `UPDATE review_packets SET data=$1 WHERE id=$2 AND tenant_id=$3`, mustJSON(packet), packetID, tenantID)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	})
 }
 
 func (s *Store) CreateAuditEvent(ctx context.Context, event domain.AuditEvent) (bool, error) {
@@ -528,23 +531,20 @@ func (s *Store) CustomerMessageBySource(ctx context.Context, tenantID, channel, 
 }
 
 func (s *Store) UpdateCustomerMessageCase(ctx context.Context, tenantID, channel, sourceMessageID, caseRunID, status string) error {
-	msg, err := s.CustomerMessageBySource(ctx, tenantID, channel, sourceMessageID)
-	if err != nil {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		msg, err := oneJSON[domain.CustomerMessage](ctx, tx,
+			`SELECT data FROM customer_messages WHERE tenant_id=$1 AND channel=$2 AND source_message_id=$3 FOR UPDATE`,
+			tenantID, channel, sourceMessageID)
+		if err != nil {
+			return err
+		}
+		msg.CaseRunID = caseRunID
+		msg.Status = status
+		_, err = tx.Exec(ctx,
+			`UPDATE customer_messages SET case_run_id=$1, status=$2, data=$3 WHERE tenant_id=$4 AND channel=$5 AND source_message_id=$6`,
+			caseRunID, status, mustJSON(msg), tenantID, channel, sourceMessageID)
 		return err
-	}
-	msg.CaseRunID = caseRunID
-	msg.Status = status
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE customer_messages SET case_run_id=$1, status=$2, data=$3 WHERE tenant_id=$4 AND channel=$5 AND source_message_id=$6`,
-		caseRunID, status, mustJSON(msg), tenantID, channel, sourceMessageID,
-	)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return domain.ErrNotFound
-	}
-	return nil
+	})
 }
 
 func (s *Store) UpsertOutboundToCustomer(ctx context.Context, out domain.OutboundToCustomer) (bool, domain.OutboundToCustomer, error) {
@@ -635,22 +635,35 @@ func (s *Store) CreateValidatedRule(ctx context.Context, rule domain.ValidatedRu
 }
 
 func (s *Store) DeprecateActiveRule(ctx context.Context, tenantID, workflowSlug, decisionType, conditionsHash string) (string, int, error) {
-	rule, err := oneJSON[domain.ValidatedRule](ctx, s.pool, `SELECT data FROM validated_rules WHERE tenant_id=$1 AND workflow_slug=$2 AND decision_type=$3 AND conditions_hash=$4 AND status='active' ORDER BY promoted_at DESC LIMIT 1`, tenantID, workflowSlug, decisionType, conditionsHash)
-	if errors.Is(err, domain.ErrNotFound) {
+	var id string
+	var version int
+	notFound := false
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		// FOR UPDATE serializes concurrent promotions: only one transaction can
+		// hold the active rule's lock, so two promotions cannot both deprecate
+		// the same row or compute the same next version.
+		rule, err := oneJSON[domain.ValidatedRule](ctx, tx, `SELECT data FROM validated_rules WHERE tenant_id=$1 AND workflow_slug=$2 AND decision_type=$3 AND conditions_hash=$4 AND status='active' ORDER BY promoted_at DESC LIMIT 1 FOR UPDATE`, tenantID, workflowSlug, decisionType, conditionsHash)
+		if errors.Is(err, domain.ErrNotFound) {
+			notFound = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		rule.Status = "deprecated"
+		if _, err := tx.Exec(ctx, `UPDATE validated_rules SET status='deprecated', data=$1 WHERE id=$2`, mustJSON(rule), rule.ID); err != nil {
+			return err
+		}
+		id, version = rule.ID, rule.Version+1
+		return nil
+	})
+	if err != nil {
+		return "", 0, err
+	}
+	if notFound {
 		return "", 1, nil
 	}
-	if err != nil {
-		return "", 0, err
-	}
-	rule.Status = "deprecated"
-	tag, err := s.pool.Exec(ctx, `UPDATE validated_rules SET status='deprecated', data=$1 WHERE id=$2`, mustJSON(rule), rule.ID)
-	if err != nil {
-		return "", 0, err
-	}
-	if tag.RowsAffected() == 0 {
-		return "", 0, domain.ErrNotFound
-	}
-	return rule.ID, rule.Version + 1, nil
+	return id, version, nil
 }
 
 func (s *Store) ListVisibleValidatedRules(ctx context.Context, tenantID, workflowSlug string) ([]domain.ValidatedRule, error) {

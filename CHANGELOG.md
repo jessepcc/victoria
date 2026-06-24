@@ -37,6 +37,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `removeString` no longer mutates the caller's (store-owned) slice in place.
 - Operator "always"/"this case" scope intent on the chat path is now honored
   (read from free text) instead of being silently dropped.
+- Postgres status/case-update methods are now transactional (`SELECT … FOR
+  UPDATE`), closing a lost-update/TOCTOU window under concurrency; concurrent
+  rule promotions can no longer both deprecate the same active rule.
+- WhatsApp self-chat (A0) echoes are filtered by message ID, so a plain-text
+  send is no longer mistaken for new operator input.
+- The in-memory store's `ActiveSkillVersion` now matches Postgres exactly
+  (dropped a `quote_drafting` fallback + slug rewrite that masked divergence).
+- Added a `-tags dev` e2e test asserting the demo `/admin/dev/*` routes are
+  mounted and functional — the complement of the production-build absence test.
 
 ### Changed
 - Module path is now `github.com/jessepcc/victoria` (clone-able import path).
