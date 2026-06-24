@@ -91,8 +91,9 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        # action v7+ is required to drive golangci-lint v2 (see .golangci.yml).
-        uses: golangci/golangci-lint-action@v8
+        # action v7+ is required to drive golangci-lint v2 (see .golangci.yml);
+        # v9 runs on Node 24.
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
 
