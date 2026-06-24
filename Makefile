@@ -57,7 +57,7 @@ lint:
 
 ## vuln: scan dependencies for known vulnerabilities (module-level)
 vuln:
-	govulncheck -scan module $(PKG)
+	govulncheck -scan module
 
 ## tidy: tidy go.mod / go.sum
 tidy:

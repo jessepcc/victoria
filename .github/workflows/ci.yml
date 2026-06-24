@@ -113,4 +113,4 @@ jobs:
           # Module-level scan: still flags known-vulnerable dependency versions,
           # but skips the source/SSA callgraph analysis that currently panics on
           # Go 1.26 generics (golang.org/x/tools ForEachElement / TypeParam).
-          govulncheck -scan module ./...
+          govulncheck -scan module
