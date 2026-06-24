@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 type Channel string
@@ -107,11 +107,12 @@ func narrateQuote(p domain.ReviewPacket, f map[string]string) string {
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "👋 New quote enquiry from *%s* — %s.\n\n", customer, project)
-	if clientType == "repeat" {
+	switch clientType {
+	case "repeat":
 		b.WriteString("They're a repeat customer (we've worked with them before).\n")
-	} else if clientType == "commercial" {
+	case "commercial":
 		b.WriteString("They look like a commercial lead.\n")
-	} else {
+	default:
 		b.WriteString("They're a new customer.\n")
 	}
 	if photosComplete {

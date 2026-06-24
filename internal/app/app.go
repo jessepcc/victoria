@@ -2,14 +2,16 @@ package app
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
-	"victoria/internal/channel"
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 type App struct {
@@ -98,20 +100,26 @@ func (a *App) ProvisionTenant(ctx context.Context, name, vertical, providerNumbe
 	}
 	// Pre-create the WhatsApp binding so the operator can pair from day 1.
 	// Status starts as qr_needed; pairing transitions it to connecting → active.
+	commandSecret, err := newCommandSecret()
+	if err != nil {
+		return domain.Tenant{}, domain.ProvisioningManifest{}, err
+	}
 	waBinding := domain.ChannelBinding{
-		TenantID:         tenant.ID,
-		Channel:          "whatsapp",
-		ProviderNumber:   providerNumber,
-		OperatorID:       operatorID,
-		SessionStatus:    domain.SessionQRNeeded,
-		SessionUpdated:   now,
-		InboundMode:      domain.InboundModeReadOnly,
-		RetentionMinutes: 30,
-		OperatorJID:      normalizeWhatsAppJID(providerNumber),
+		TenantID:                  tenant.ID,
+		Channel:                   "whatsapp",
+		ProviderNumber:            providerNumber,
+		OperatorID:                operatorID,
+		SessionStatus:             domain.SessionQRNeeded,
+		SessionUpdated:            now,
+		InboundMode:               domain.InboundModeReadOnly,
+		RetentionMinutes:          30,
+		OperatorJID:               normalizeWhatsAppJID(providerNumber),
+		CommandRegistrationSecret: commandSecret,
 	}
 	if err := a.store.UpsertChannelBinding(ctx, waBinding); err != nil {
 		return domain.Tenant{}, domain.ProvisioningManifest{}, err
 	}
+	manifest.WhatsAppCommandSecret = commandSecret
 	for _, workflowSlug := range []string{"enquiry_triage", "invoice_handling"} {
 		if err := a.store.CreateSkillVersion(ctx, domain.SkillVersion{
 			ID:           a.ids.NewID("sv"),
@@ -125,13 +133,46 @@ func (a *App) ProvisionTenant(ctx context.Context, name, vertical, providerNumbe
 			return domain.Tenant{}, domain.ProvisioningManifest{}, err
 		}
 	}
-	_, err := a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, tenant.ID, "tenant_provisioned", "admin", "system", "tenant", tenant.ID, nil, map[string]any{
+	_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, now, tenant.ID, "tenant_provisioned", "admin", "system", "tenant", tenant.ID, nil, map[string]any{
 		"vertical": tenant.Vertical,
 	}, "tenant-provisioned", tenant.ID))
 	if err != nil {
 		return domain.Tenant{}, domain.ProvisioningManifest{}, err
 	}
 	return tenant, manifest, nil
+}
+
+// ReissueWhatsAppCommandSecret rotates the secret used to authorize
+// `register me as operator <secret>` from a new operator JID. Use it when the
+// original secret was leaked, lost, or already consumed but a new operator
+// needs to register. Returns the new plaintext secret exactly once.
+func (a *App) ReissueWhatsAppCommandSecret(ctx context.Context, tenantID string) (string, error) {
+	binding, err := a.store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return "", err
+	}
+	secret, err := newCommandSecret()
+	if err != nil {
+		return "", err
+	}
+	binding.CommandRegistrationSecret = secret
+	binding.CommandSecretConsumedAt = nil
+	binding.SessionUpdated = a.clock.Now().UTC()
+	if err := a.store.UpsertChannelBinding(ctx, binding); err != nil {
+		return "", err
+	}
+	return secret, nil
+}
+
+// newCommandSecret generates a 16-byte (128-bit) hex-encoded secret for the
+// `register me as operator` flow. Single-use; persisted on the binding until
+// consumed or reissued.
+func newCommandSecret() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("command secret: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 type StartCaseInput struct {
@@ -259,20 +300,32 @@ func (a *App) RecordOutboundBlocked(ctx context.Context, tenantID, dstJID, bodyH
 	return err
 }
 
+// IngestCustomerMessage is the canonical 00-channel ingestion entry point
+// per spec §4.1. Idempotent on (tenant_id, channel, source_message_id);
+// re-deliveries return the existing case_run_id.
 func (a *App) IngestCustomerMessage(ctx context.Context, event IngestionEvent) (string, error) {
+	id, _, err := a.IngestCustomerMessageWithPacket(ctx, event)
+	return id, err
+}
+
+// IngestCustomerMessageWithPacket is the same operation but also returns the
+// freshly-created review packet so HTTP callers can surface it without a
+// separate lookup (useful for demos and ops tooling). On idempotent replay
+// the packet is empty — the existing case_run_id alone is the contract.
+func (a *App) IngestCustomerMessageWithPacket(ctx context.Context, event IngestionEvent) (string, domain.ReviewPacket, error) {
 	event.TenantID = strings.TrimSpace(event.TenantID)
 	event.Channel = strings.TrimSpace(event.Channel)
 	event.SourceMessageID = strings.TrimSpace(event.SourceMessageID)
 	event.CustomerIdentifier = strings.TrimSpace(event.CustomerIdentifier)
 	event.BodyText = strings.TrimSpace(event.BodyText)
 	if event.TenantID == "" || event.Channel == "" || event.SourceMessageID == "" || event.CustomerIdentifier == "" || event.BodyText == "" {
-		return "", domain.ErrInvalidInput
+		return "", domain.ReviewPacket{}, domain.ErrInvalidInput
 	}
 	if event.ReceivedAt.IsZero() {
 		event.ReceivedAt = a.clock.Now()
 	}
 	if _, err := a.store.GetTenant(ctx, event.TenantID); err != nil {
-		return "", err
+		return "", domain.ReviewPacket{}, err
 	}
 	msg := domain.CustomerMessage{
 		ID:                 a.ids.NewID("cm"),
@@ -288,12 +341,20 @@ func (a *App) IngestCustomerMessage(ctx context.Context, event IngestionEvent) (
 	}
 	created, stored, err := a.store.CreateCustomerMessage(ctx, msg)
 	if err != nil {
-		return "", err
+		return "", domain.ReviewPacket{}, err
 	}
 	if !created {
-		return stored.CaseRunID, nil
+		// Idempotent replay. If a case was already started, its id is the
+		// contract. But if a previous attempt failed before StartCase
+		// succeeded (no case_run_id recorded), reprocess rather than returning
+		// an empty id as success — otherwise a transient failure would
+		// permanently poison this source_message_id against retry.
+		if stored.CaseRunID != "" {
+			return stored.CaseRunID, domain.ReviewPacket{}, nil
+		}
+		msg = stored
 	}
-	run, _, err := a.StartCase(ctx, StartCaseInput{
+	run, packet, err := a.StartCase(ctx, StartCaseInput{
 		TenantID:     event.TenantID,
 		WorkflowSlug: "enquiry_triage",
 		Mode:         domain.ModeSandbox,
@@ -301,10 +362,10 @@ func (a *App) IngestCustomerMessage(ctx context.Context, event IngestionEvent) (
 	})
 	if err != nil {
 		_ = a.store.UpdateCustomerMessageCase(ctx, event.TenantID, event.Channel, event.SourceMessageID, "", "failed")
-		return "", err
+		return "", domain.ReviewPacket{}, err
 	}
 	if err := a.store.UpdateCustomerMessageCase(ctx, event.TenantID, event.Channel, event.SourceMessageID, run.ID, "ingested"); err != nil {
-		return "", err
+		return "", domain.ReviewPacket{}, err
 	}
 	_, err = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), event.TenantID, "customer_message_received", "customer", event.CustomerIdentifier, "customer_message", msg.ID, map[string]any{
 		"case_run_id": run.ID,
@@ -314,9 +375,9 @@ func (a *App) IngestCustomerMessage(ctx context.Context, event IngestionEvent) (
 		"customer_identifier": event.CustomerIdentifier,
 	}, "customer-message-received", event.TenantID, event.Channel, event.SourceMessageID))
 	if err != nil {
-		return "", err
+		return "", domain.ReviewPacket{}, err
 	}
-	return run.ID, nil
+	return run.ID, packet, nil
 }
 
 func (a *App) StartCase(ctx context.Context, input StartCaseInput) (domain.CaseRun, domain.ReviewPacket, error) {
@@ -616,6 +677,9 @@ func (a *App) handleWhatsAppCommand(ctx context.Context, tenantID string, bindin
 		if err := a.store.UpsertChannelBinding(ctx, binding); err != nil {
 			return true, err
 		}
+		// AC-A1.1 closing half: any review packets queued before a command
+		// identity was registered now have a recipient and can be delivered.
+		a.gateway.DrainQueue(ctx, tenantID, channel.ChannelWhatsApp)
 		a.gateway.SendNotification(ctx, tenantID, "✓ registered as operator")
 		return true, nil
 	case !isOperator:
@@ -827,75 +891,36 @@ func extractPacketReference(text string) string {
 	return rest[:end]
 }
 
-// guessButtonFromText derives an action_button from a free-text reply.
-// Real operators type natural language, not "wrong action ..." prefixes, so
-// we apply a two-stage decision:
-//  1. Numeric (1..6) or short positive ack ("approve" / "ok" / "yes" / "👍")
-//     → exact button match.
-//  2. Anything else (substantive prose) → ActionWrongAction with the prose
-//     preserved as free_text. structuredRuleFromCorrection then mines the
-//     content for known patterns (singapore/no gst, photos, send anyway, etc).
-//
-// This is the spec's Stage 2 (text-match) cascade per operator-ux §7.1.
-// Stage 3 (LLM-assisted) is deferred to Phase 2 per RESOLVED-OE-OU-2.
-func guessButtonFromText(text string) domain.ActionButton {
-	clean := strings.ToLower(strings.TrimSpace(text))
-	if clean == "" {
-		return ""
-	}
-	// Direct button selection: digit or exact-prefix label.
-	switch {
-	case clean == "1":
-		return domain.ActionApprove
-	case clean == "2":
-		return domain.ActionWrongFacts
-	case clean == "3":
-		return domain.ActionWrongAction
-	case clean == "4":
-		return domain.ActionMissingCondition
-	case clean == "5":
-		return domain.ActionUseDifferentTemplate
-	case clean == "6":
-		return domain.ActionAddNote
-	}
-	// Short positive acknowledgement → approve.
-	if isApprovalText(clean) {
-		return domain.ActionApprove
-	}
-	// Explicit button labels still respected when typed verbatim.
-	switch {
-	case strings.HasPrefix(clean, "wrong facts"):
-		return domain.ActionWrongFacts
-	case strings.HasPrefix(clean, "wrong action"):
-		return domain.ActionWrongAction
-	case strings.HasPrefix(clean, "missing"):
-		return domain.ActionMissingCondition
-	case strings.HasPrefix(clean, "use different"):
-		return domain.ActionUseDifferentTemplate
-	case strings.HasPrefix(clean, "add note"):
-		return domain.ActionAddNote
-	}
-	// Any other substantive text is treated as a correction. The actual
-	// semantic conversion (text → conditions + recommended_action) happens
-	// downstream in structuredRuleFromCorrection during the merge step.
-	return domain.ActionWrongAction
-}
-
-func isApprovalText(clean string) bool {
-	if len(clean) > 32 {
-		return false
-	}
-	switch clean {
-	case "approve", "approved", "ok", "okay", "yes", "y", "yep", "yup",
-		"sure", "looks good", "lgtm", "go", "go ahead", "send", "send it",
-		"confirm", "confirmed", "👍", "👌", "✅":
-		return true
-	}
-	return strings.HasPrefix(clean, "approve")
-}
-
 func (a *App) ListCandidates(ctx context.Context, tenantID string) ([]domain.RuleCandidate, error) {
 	return a.store.ListCandidates(ctx, tenantID)
+}
+
+// ListAuditEvents returns immutable audit events for a tenant in occurrence
+// order. Optional filters narrow the result by event_type list and apply a
+// max-count cap (0 = unlimited). Used by ops + demo tooling — no PII filter
+// is applied since audit data is intentionally retained.
+func (a *App) ListAuditEvents(ctx context.Context, tenantID string, eventTypes []string, limit int) ([]domain.AuditEvent, error) {
+	events, err := a.store.ListAuditEvents(ctx, tenantID)
+	if err != nil {
+		return nil, err
+	}
+	if len(eventTypes) > 0 {
+		filter := make(map[string]struct{}, len(eventTypes))
+		for _, t := range eventTypes {
+			filter[t] = struct{}{}
+		}
+		filtered := events[:0]
+		for _, e := range events {
+			if _, ok := filter[e.EventType]; ok {
+				filtered = append(filtered, e)
+			}
+		}
+		events = filtered
+	}
+	if limit > 0 && len(events) > limit {
+		events = events[len(events)-limit:]
+	}
+	return events, nil
 }
 
 func (a *App) PromoteCandidate(ctx context.Context, tenantID, candidateID, reviewerID, rationale string) (domain.ValidatedRule, domain.SkillVersion, error) {
@@ -1111,19 +1136,31 @@ func (a *App) SendApprovedCustomerReply(ctx context.Context, tenantID, caseRunID
 	bodyHash := domain.SHA256Key(body)
 	switch mode {
 	case domain.InboundModeReadOnly:
-		recipient := binding.DraftDeliveryJID
-		if recipient == "" {
-			recipient = binding.OperatorJID
-		}
+		recipient := operatorRecipient(binding)
 		if recipient == "" {
 			recipient = normalizeWhatsAppJID(binding.ProviderNumber)
+		}
+		// A0 draft delivery is split into TWO WhatsApp messages so the operator
+		// can long-press the second (clean draft body) and Forward straight to
+		// the customer's chat — no copy/paste, no editing out a wrapper. The
+		// first message carries the approval acknowledgement + instructions.
+		customer := pickCustomerLabel(run.InputPayload)
+		instruction := fmt.Sprintf("✅ Approved. Long-press the next message → Forward → pick %s's chat.", customer)
+		if err := a.sendWhatsApp(ctx, binding, channel.OutboundMessage{
+			TenantID:            tenantID,
+			RecipientIdentifier: recipient,
+			PacketID:            run.DecisionPointID,
+			BodyText:            instruction,
+			IdempotencyKey:      domain.SHA256Key("draft-instruction", tenantID, caseRunID, bodyHash),
+		}); err != nil {
+			return domain.OutboundToCustomer{}, err
 		}
 		if err := a.sendWhatsApp(ctx, binding, channel.OutboundMessage{
 			TenantID:            tenantID,
 			RecipientIdentifier: recipient,
 			PacketID:            run.DecisionPointID,
-			BodyText:            renderOperatorDraft(run, body),
-			IdempotencyKey:      domain.SHA256Key("draft-delivery", tenantID, caseRunID, bodyHash),
+			BodyText:            body,
+			IdempotencyKey:      domain.SHA256Key("draft-body", tenantID, caseRunID, bodyHash),
 		}); err != nil {
 			return domain.OutboundToCustomer{}, err
 		}
@@ -1274,6 +1311,10 @@ func (a *App) mergeCandidate(ctx context.Context, correction domain.Correction) 
 		_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), correction.TenantID, "correction_parse_failed", "system", "learning", "correction", correction.ID, nil, map[string]any{
 			"action_button": string(correction.ActionButton),
 		}, "parse-failed", correction.TenantID, correction.ID))
+		// Tier E: clarification turn. Silent failure is bad UX — operators
+		// don't know whether their correction took. Send back an explicit
+		// "I didn't catch that" so they know to rephrase.
+		a.gateway.SendNotification(ctx, correction.TenantID, formatClarificationRequest(correction.FreeText))
 		return nil
 	}
 	conditionsHash, canonical, err := domain.ConditionsHash(conditions)
@@ -1341,6 +1382,7 @@ func (a *App) mergeCandidate(ctx context.Context, correction domain.Correction) 
 			"correction_id": correction.ID,
 		}, nil, "candidate-created", correction.TenantID, candidate.ID))
 		a.gateway.SendNotification(ctx, correction.TenantID, formatLearningStatus(candidate, "first"))
+		a.deliverCorrectionDraftIfPossible(ctx, correction, point, recommendedAction)
 		return err
 	}
 	if contains(match.SourceCorrectionIDs, correction.ID) {
@@ -1363,7 +1405,78 @@ func (a *App) mergeCandidate(ctx context.Context, correction domain.Correction) 
 		"correction_id": correction.ID,
 	}, nil, "candidate-evidence", correction.TenantID, match.ID, correction.ID))
 	a.gateway.SendNotification(ctx, correction.TenantID, formatLearningStatus(match, "evidence"))
+	a.deliverCorrectionDraftIfPossible(ctx, correction, point, recommendedAction)
 	return err
+}
+
+// deliverCorrectionDraftIfPossible sends a 2-message forwardable draft to the
+// operator when the structured parser successfully extracted a recommended
+// action from the correction. Closes the operator's immediate loop: they
+// just corrected Victoria, but they still need to actually reply to THIS
+// customer — Victoria should hand them a forward-ready draft.
+//
+// A0 (read_only) only. In A1, approval sends to the customer directly so
+// the operator never needs to forward by hand. Best-effort: send failures
+// are silently swallowed (the rule-learning side-effect is the durable bit).
+func (a *App) deliverCorrectionDraftIfPossible(ctx context.Context, correction domain.Correction, point domain.DecisionPoint, recommendedAction string) {
+	binding, err := a.store.ChannelBindingByTenant(ctx, correction.TenantID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		return
+	}
+	if domain.ParseInboundMode(string(binding.InboundMode)) != domain.InboundModeReadOnly {
+		return
+	}
+	body := draftBodyForAction(recommendedAction, point.AgentInput)
+	if body == "" {
+		return
+	}
+	recipient := operatorRecipient(binding)
+	if recipient == "" {
+		recipient = normalizeWhatsAppJID(binding.ProviderNumber)
+	}
+	customer := pickCustomerLabel(point.AgentInput)
+	instruction := fmt.Sprintf("📝 Draft for %s based on your correction — long-press the next message → Forward.", customer)
+	bodyHash := domain.SHA256Key(body)
+	if err := a.sendWhatsApp(ctx, binding, channel.OutboundMessage{
+		TenantID:            correction.TenantID,
+		RecipientIdentifier: recipient,
+		PacketID:            correction.DecisionPointID,
+		BodyText:            instruction,
+		IdempotencyKey:      domain.SHA256Key("correction-draft-instruction", correction.ID, bodyHash),
+	}); err != nil {
+		return
+	}
+	if err := a.sendWhatsApp(ctx, binding, channel.OutboundMessage{
+		TenantID:            correction.TenantID,
+		RecipientIdentifier: recipient,
+		PacketID:            correction.DecisionPointID,
+		BodyText:            body,
+		IdempotencyKey:      domain.SHA256Key("correction-draft-body", correction.ID, bodyHash),
+	}); err != nil {
+		return
+	}
+	_, _ = a.store.CreateAuditEvent(ctx, auditEvent(a.ids, a.clock.Now(), correction.TenantID, "outbound_correction_draft_delivered", "system", "app", "correction", correction.ID, nil, map[string]any{
+		"body_hash":          bodyHash,
+		"recommended_action": recommendedAction,
+	}, "correction-draft-delivered", correction.TenantID, correction.ID, bodyHash))
+}
+
+// formatClarificationRequest is the operator-visible message Victoria sends
+// when the structured parser couldn't extract a rule from the correction
+// text — typically a typo, a too-vague instruction, or a phrasing the
+// keyword + Levenshtein layers don't cover. The point is to keep the loop
+// alive: the operator knows their correction didn't take, and they can
+// rephrase. Silent failure (the previous behavior) led to operators
+// thinking they'd corrected Victoria when they hadn't.
+func formatClarificationRequest(freeText string) string {
+	cleaned := strings.TrimSpace(freeText)
+	if len(cleaned) > 80 {
+		cleaned = cleaned[:80] + "…"
+	}
+	return fmt.Sprintf(
+		"📝 I didn't quite catch that (\"%s\"). Could you rephrase?\n\nExamples:\n• \"hold and ask for photos\"\n• \"send it anyway\"\n• \"no GST — overseas supplier\"\n• \"use corporate template\"",
+		cleaned,
+	)
 }
 
 // formatContradictionAlert is the operator-visible message Victoria sends
@@ -1536,279 +1649,4 @@ func (a *App) buildReviewPacket(now time.Time, run domain.CaseRun, point domain.
 		ExpiresAt:      expiresAt,
 		IdempotencyKey: domain.SHA256Key(run.TenantID, point.ID, "packet", "1"),
 	}
-}
-
-func defaultWorkflowTemplates(vertical string) []domain.WorkflowTemplate {
-	return []domain.WorkflowTemplate{
-		{ID: "wt_enquiry_" + vertical, Slug: "enquiry_triage", Vertical: vertical, DisplayName: "Enquiry triage", DecisionTypes: []string{"route_or_reply"}},
-		{ID: "wt_quote_" + vertical, Slug: "quote_drafting", Vertical: vertical, DisplayName: "Quote drafting", DecisionTypes: []string{"send_or_hold"}},
-		{ID: "wt_invoice_" + vertical, Slug: "invoice_handling", Vertical: vertical, DisplayName: "Invoice handling", DecisionTypes: []string{"tax_treatment"}},
-	}
-}
-
-func workflowDecision(workflowSlug string) (string, string) {
-	switch workflowSlug {
-	case "invoice_handling":
-		return "tax_treatment", "apply_gst"
-	case "enquiry_triage":
-		return "route_or_reply", "draft_reply"
-	default:
-		return "send_or_hold", "send_quote"
-	}
-}
-
-func workflowFromCaseInput(input map[string]any) string {
-	if value, ok := input["workflow_slug"].(string); ok && value != "" {
-		return value
-	}
-	return "quote_drafting"
-}
-
-func structuredRuleFromCorrection(c domain.Correction, point domain.DecisionPoint) ([]domain.Condition, string) {
-	text := strings.ToLower(c.FreeText + " " + c.FollowUpAnswer)
-	switch {
-	case strings.Contains(text, "singapore") || strings.Contains(text, "no gst"):
-		return []domain.Condition{{Field: "supplier_country", Operator: "!=", Value: "AU"}}, "apply_no_gst"
-	case strings.Contains(text, "commercial") && strings.Contains(text, "template"):
-		return []domain.Condition{{Field: "enquiry_type", Operator: "=", Value: "commercial"}}, "use_corporate_template"
-	case strings.Contains(text, "send it anyway") || strings.Contains(text, "go ahead"):
-		return []domain.Condition{
-			{Field: "photos_complete", Operator: "=", Value: boolValue(point.AgentInput, "photos_complete")},
-			{Field: "client_type", Operator: "=", Value: stringValue(point.AgentInput, "client_type", "new")},
-		}, "send_quote"
-	case strings.Contains(text, "repeat") || strings.Contains(text, "known client"):
-		return []domain.Condition{
-			{Field: "photos_complete", Operator: "=", Value: boolValue(point.AgentInput, "photos_complete")},
-			{Field: "client_type", Operator: "=", Value: "repeat"},
-		}, "send_quote"
-	case strings.Contains(text, "photo") || strings.Contains(text, "hold") || strings.Contains(text, "more info"):
-		return []domain.Condition{
-			{Field: "photos_complete", Operator: "=", Value: false},
-			{Field: "client_type", Operator: "=", Value: stringValue(point.AgentInput, "client_type", "new")},
-		}, "hold_and_request_more_info"
-	default:
-		if c.ActionButton == domain.ActionUseDifferentTemplate {
-			return []domain.Condition{{Field: "enquiry_type", Operator: "=", Value: stringValue(point.AgentInput, "enquiry_type", "commercial")}}, "use_corporate_template"
-		}
-		return nil, ""
-	}
-}
-
-func conditionsMatch(payload map[string]any, conditions []domain.Condition) bool {
-	for _, condition := range conditions {
-		actual, ok := payload[condition.Field]
-		switch condition.Operator {
-		case "=":
-			if !ok || fmt.Sprint(actual) != fmt.Sprint(condition.Value) {
-				return false
-			}
-		case "!=":
-			if ok && fmt.Sprint(actual) == fmt.Sprint(condition.Value) {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func redactAggregateConditions(conditions []domain.Condition) ([]domain.Condition, bool) {
-	out := make([]domain.Condition, 0, len(conditions))
-	quarantine := false
-	for _, condition := range conditions {
-		redacted := condition
-		value := fmt.Sprint(condition.Value)
-		lowerField := strings.ToLower(condition.Field)
-		switch {
-		case strings.Contains(value, "@"):
-			redacted.Value = "<email>"
-		case strings.Contains(lowerField, "client_name") || strings.Contains(lowerField, "customer_name"):
-			redacted.Value = "<quarantined:freetext>"
-			quarantine = true
-		case looksLikeFreeText(value):
-			redacted.Value = "<quarantined:freetext>"
-			quarantine = true
-		}
-		out = append(out, redacted)
-	}
-	return out, quarantine
-}
-
-func looksLikeFreeText(value string) bool {
-	if value == "" {
-		return false
-	}
-	allowed := map[string]struct{}{
-		"true": {}, "false": {}, "new": {}, "repeat": {}, "commercial": {}, "residential": {}, "AU": {}, "SG": {},
-	}
-	if _, ok := allowed[value]; ok {
-		return false
-	}
-	return strings.Contains(value, " ")
-}
-
-func factsFromPayload(payload map[string]any) []domain.Fact {
-	keys := make([]string, 0, len(payload))
-	for key := range payload {
-		if key != "sandbox" {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
-	facts := make([]domain.Fact, 0, len(keys))
-	for _, key := range keys {
-		facts = append(facts, domain.Fact{Label: key, Value: fmt.Sprint(payload[key]), Confidence: 1})
-	}
-	return facts
-}
-
-func payloadFromIngestionEvent(event IngestionEvent) map[string]any {
-	payload := map[string]any{
-		"sandbox":             true,
-		"source_channel":      event.Channel,
-		"source_message_id":   event.SourceMessageID,
-		"customer_identifier": event.CustomerIdentifier,
-		"received_at":         event.ReceivedAt.UTC().Format(time.RFC3339),
-		"body_text":           event.BodyText,
-		"message_excerpt":     excerpt(event.BodyText, 180),
-		"from":                event.CustomerIdentifier,
-	}
-	if strings.TrimSpace(event.Subject) != "" {
-		payload["subject"] = strings.TrimSpace(event.Subject)
-	}
-	if len(event.Metadata) > 0 {
-		payload["metadata"] = cloneMap(event.Metadata)
-	}
-	return payload
-}
-
-func draftBodyForRun(run domain.CaseRun) string {
-	customer := stringValue(run.InputPayload, "customer_identifier", "there")
-	switch run.WorkflowSlug {
-	case "quote_drafting":
-		return fmt.Sprintf("Hi! Thanks for reaching out. We can help with that quote, %s. Could you send 2-3 photos so we can size it correctly?", customer)
-	default:
-		body := stringValue(run.InputPayload, "body_text", "")
-		if body == "" {
-			return "Hi! Thanks for reaching out. We'll review this and get back to you shortly."
-		}
-		return "Hi! Thanks for reaching out. We'll review your message and get back to you shortly."
-	}
-}
-
-func renderOperatorDraft(run domain.CaseRun, body string) string {
-	customer := stringValue(run.InputPayload, "customer_identifier", "the customer")
-	return fmt.Sprintf("✅ Approved. Here's the draft to send to %s:\n\n──────\n%s\n──────\n\nLong-press, Forward, pick the customer's chat.", customer, body)
-}
-
-func excerpt(value string, limit int) string {
-	value = strings.TrimSpace(value)
-	if limit <= 0 || len(value) <= limit {
-		return value
-	}
-	return strings.TrimSpace(value[:limit])
-}
-
-func normalizeInboundJID(msg channel.InboundMessage) string {
-	if jid := normalizeWhatsAppJID(msg.SenderJID); jid != "" {
-		return jid
-	}
-	return normalizeWhatsAppJID(msg.SenderIdentifier)
-}
-
-func normalizeWhatsAppJID(input string) string {
-	clean := strings.TrimSpace(input)
-	if clean == "" {
-		return ""
-	}
-	if strings.ContainsRune(clean, '@') {
-		return clean
-	}
-	clean = strings.TrimPrefix(clean, "+")
-	return clean + "@s.whatsapp.net"
-}
-
-func removeString(values []string, target string) []string {
-	out := values[:0]
-	for _, value := range values {
-		if value != target {
-			out = append(out, value)
-		}
-	}
-	return out
-}
-
-func auditEvent(ids IDGenerator, now time.Time, tenantID, eventType, actorType, actorID, refType, refID string, related map[string]any, payload map[string]any, keyParts ...string) domain.AuditEvent {
-	return domain.AuditEvent{
-		ID:             ids.NewID("ae"),
-		TenantID:       tenantID,
-		EventType:      eventType,
-		ActorType:      actorType,
-		ActorID:        actorID,
-		RefType:        refType,
-		RefID:          refID,
-		RelatedIDs:     cloneMap(related),
-		Payload:        cloneMap(payload),
-		IdempotencyKey: domain.SHA256Key(keyParts...),
-		OccurredAt:     now,
-	}
-}
-
-func scopePriority(scope domain.Scope) int {
-	switch scope {
-	case domain.ScopeCase:
-		return 4
-	case domain.ScopeTenant:
-		return 3
-	case domain.ScopeVertical:
-		return 2
-	default:
-		return 1
-	}
-}
-
-func boolValue(payload map[string]any, key string) bool {
-	value, ok := payload[key]
-	if !ok {
-		return false
-	}
-	if b, ok := value.(bool); ok {
-		return b
-	}
-	return fmt.Sprint(value) == "true"
-}
-
-func stringValue(payload map[string]any, key, fallback string) string {
-	if value, ok := payload[key]; ok && fmt.Sprint(value) != "" {
-		return fmt.Sprint(value)
-	}
-	return fallback
-}
-
-func cloneMap(in map[string]any) map[string]any {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]any, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
-}
-
-func contains(values []string, value string) bool {
-	for _, current := range values {
-		if current == value {
-			return true
-		}
-	}
-	return false
-}
-
-func appendIfMissing(values []string, value string) []string {
-	if contains(values, value) {
-		return values
-	}
-	return append(values, value)
 }

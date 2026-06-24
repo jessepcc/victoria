@@ -9,9 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"victoria/internal/app"
-	"victoria/internal/domain"
-	"victoria/internal/store/postgres"
+	"github.com/jessepcc/victoria/internal/app"
+	"github.com/jessepcc/victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/store/postgres"
 )
 
 func TestPostgresStoreCorrectionLoopAndAuditImmutability(t *testing.T) {

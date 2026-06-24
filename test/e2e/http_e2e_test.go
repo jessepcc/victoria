@@ -8,21 +8,24 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"victoria/internal/app"
-	"victoria/internal/domain"
-	"victoria/internal/httpapi"
-	"victoria/internal/store/memory"
+	"github.com/jessepcc/victoria/internal/app"
+	"github.com/jessepcc/victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/httpapi"
+	"github.com/jessepcc/victoria/internal/store/memory"
 )
 
 func TestHTTPGoldenCorrectionLoop(t *testing.T) {
 	application := app.New(memory.New())
-	server := httptest.NewServer(httpapi.New(application, nil).Handler())
+	apiServer := httpapi.New(application, nil)
+	apiServer.SetGatewayInboundToken("test-gw-token")
+	apiServer.SetAdminToken(testAdminToken)
+	server := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(server.Close)
 
 	var provision struct {
 		Tenant domain.Tenant `json:"tenant"`
 	}
-	post(t, server.URL+"/admin/tenants", "", map[string]any{
+	adminPost(t, server.URL+"/admin/tenants", map[string]any{
 		"name":            "ABC Roofing",
 		"vertical":        "roofing",
 		"provider_number": "+61400000000",
@@ -50,7 +53,10 @@ func TestHTTPGoldenCorrectionLoop(t *testing.T) {
 		if i == 0 {
 			firstPacket = start.ReviewPacket
 		}
-		post(t, server.URL+"/gateway/inbound", "", map[string]any{
+		postWithHeaders(t, server.URL+"/gateway/inbound", map[string]string{
+			"Content-Type":  "application/json",
+			"Authorization": "Bearer gw:test-gw-token",
+		}, map[string]any{
 			"channel":           "telegram",
 			"provider_number":   "+61400000000",
 			"packet_id":         start.ReviewPacket.PacketID,
@@ -76,7 +82,7 @@ func TestHTTPGoldenCorrectionLoop(t *testing.T) {
 		ValidatedRule domain.ValidatedRule `json:"validated_rule"`
 		SkillVersion  domain.SkillVersion  `json:"skill_version"`
 	}
-	post(t, server.URL+"/admin/candidates/"+provision.Tenant.ID+"/"+listed.Candidates[0].ID+"/promote", "", map[string]any{
+	adminPost(t, server.URL+"/admin/candidates/"+provision.Tenant.ID+"/"+listed.Candidates[0].ID+"/promote", map[string]any{
 		"reviewer_id": "reviewer:alice",
 		"rationale":   "three matching corrections",
 	}, &promoted, http.StatusCreated)
@@ -115,13 +121,15 @@ func TestHTTPGoldenCorrectionLoop(t *testing.T) {
 
 func TestHTTPTenantContextComesFromAuthToken(t *testing.T) {
 	application := app.New(memory.New())
-	server := httptest.NewServer(httpapi.New(application, nil).Handler())
+	apiServer := httpapi.New(application, nil)
+	apiServer.SetAdminToken(testAdminToken)
+	server := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(server.Close)
 
 	var tenantA struct {
 		Tenant domain.Tenant `json:"tenant"`
 	}
-	post(t, server.URL+"/admin/tenants", "", map[string]any{
+	adminPost(t, server.URL+"/admin/tenants", map[string]any{
 		"name":            "Tenant A",
 		"vertical":        "roofing",
 		"provider_number": "+61400000000",
@@ -131,7 +139,7 @@ func TestHTTPTenantContextComesFromAuthToken(t *testing.T) {
 	var tenantB struct {
 		Tenant domain.Tenant `json:"tenant"`
 	}
-	post(t, server.URL+"/admin/tenants", "", map[string]any{
+	adminPost(t, server.URL+"/admin/tenants", map[string]any{
 		"name":            "Tenant B",
 		"vertical":        "roofing",
 		"provider_number": "+61400000001",
@@ -180,13 +188,15 @@ func TestHTTPTenantContextComesFromAuthToken(t *testing.T) {
 
 func TestHTTPMCPWriteFinalBoundTenantFromAuth(t *testing.T) {
 	application := app.New(memory.New())
-	server := httptest.NewServer(httpapi.New(application, nil).Handler())
+	apiServer := httpapi.New(application, nil)
+	apiServer.SetAdminToken(testAdminToken)
+	server := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(server.Close)
 
 	var tenantA struct {
 		Tenant domain.Tenant `json:"tenant"`
 	}
-	post(t, server.URL+"/admin/tenants", "", map[string]any{
+	adminPost(t, server.URL+"/admin/tenants", map[string]any{
 		"name":            "Tenant A",
 		"vertical":        "roofing",
 		"provider_number": "+61400000000",
@@ -195,7 +205,7 @@ func TestHTTPMCPWriteFinalBoundTenantFromAuth(t *testing.T) {
 	var tenantB struct {
 		Tenant domain.Tenant `json:"tenant"`
 	}
-	post(t, server.URL+"/admin/tenants", "", map[string]any{
+	adminPost(t, server.URL+"/admin/tenants", map[string]any{
 		"name":            "Tenant B",
 		"vertical":        "roofing",
 		"provider_number": "+61400000001",
@@ -227,13 +237,15 @@ func TestHTTPMCPWriteFinalBoundTenantFromAuth(t *testing.T) {
 
 func TestHTTPCustomerInboundAndWhatsAppAllowlistAPI(t *testing.T) {
 	application := app.New(memory.New())
-	server := httptest.NewServer(httpapi.New(application, nil).Handler())
+	apiServer := httpapi.New(application, nil)
+	apiServer.SetAdminToken(testAdminToken)
+	server := httptest.NewServer(apiServer.Handler())
 	t.Cleanup(server.Close)
 
 	var provision struct {
 		Tenant domain.Tenant `json:"tenant"`
 	}
-	post(t, server.URL+"/admin/tenants", "", map[string]any{
+	adminPost(t, server.URL+"/admin/tenants", map[string]any{
 		"name":            "Tenant A",
 		"vertical":        "roofing",
 		"provider_number": "+61400000000",
@@ -295,6 +307,124 @@ func TestHTTPCustomerInboundAndWhatsAppAllowlistAPI(t *testing.T) {
 	if duplicate.CaseRunID != ingest.CaseRunID {
 		t.Fatalf("duplicate case_run_id = %s, want %s", duplicate.CaseRunID, ingest.CaseRunID)
 	}
+}
+
+func TestHTTPWhatsAppCommandSecretLifecycle(t *testing.T) {
+	application := app.New(memory.New())
+	apiServer := httpapi.New(application, nil)
+	apiServer.SetAdminToken(testAdminToken)
+	server := httptest.NewServer(apiServer.Handler())
+	t.Cleanup(server.Close)
+
+	var provision struct {
+		Tenant   domain.Tenant               `json:"tenant"`
+		Manifest domain.ProvisioningManifest `json:"manifest"`
+	}
+	adminPost(t, server.URL+"/admin/tenants", map[string]any{
+		"name":            "Tenant Sec",
+		"vertical":        "roofing",
+		"provider_number": "+61400000099",
+		"operator_id":     "op_telegram:sec",
+	}, &provision, http.StatusCreated)
+	if provision.Manifest.WhatsAppCommandSecret == "" {
+		t.Fatal("provisioning response missing whatsapp_command_secret")
+	}
+	originalSecret := provision.Manifest.WhatsAppCommandSecret
+
+	// Acknowledge consent — response includes the binding. Secret MUST be redacted.
+	var consent struct {
+		Binding map[string]any `json:"binding"`
+	}
+	post(t, server.URL+"/channel-bindings/whatsapp/consent", provision.Tenant.ID, map[string]any{
+		"inbound_mode": "full_control",
+	}, &consent, http.StatusOK)
+	if _, leaked := consent.Binding["command_registration_secret"]; leaked {
+		t.Fatalf("consent response leaked command_registration_secret: %+v", consent.Binding)
+	}
+
+	// Reissue endpoint returns a fresh, distinct secret.
+	var reissue struct {
+		WhatsAppCommandSecret string `json:"whatsapp_command_secret"`
+	}
+	adminPost(t, server.URL+"/admin/channel-bindings/whatsapp/command-secret", map[string]any{
+		"tenant_id": provision.Tenant.ID,
+	}, &reissue, http.StatusOK)
+	if reissue.WhatsAppCommandSecret == "" {
+		t.Fatal("reissue response missing whatsapp_command_secret")
+	}
+	if reissue.WhatsAppCommandSecret == originalSecret {
+		t.Fatal("reissued secret matches original; rotation not effective")
+	}
+}
+
+func TestHTTPGatewayInboundRequiresToken(t *testing.T) {
+	application := app.New(memory.New())
+	apiServer := httpapi.New(application, nil)
+	server := httptest.NewServer(apiServer.Handler())
+	t.Cleanup(server.Close)
+
+	// No token configured at all → 503 default-deny (operator-reply webhook closed).
+	postWithHeaders(t, server.URL+"/gateway/inbound", map[string]string{
+		"Content-Type": "application/json",
+	}, map[string]any{}, nil, http.StatusServiceUnavailable)
+
+	// Configure a token; missing/incorrect Authorization → 401.
+	apiServer.SetGatewayInboundToken("right-token")
+	postWithHeaders(t, server.URL+"/gateway/inbound", map[string]string{
+		"Content-Type": "application/json",
+	}, map[string]any{}, nil, http.StatusUnauthorized)
+	postWithHeaders(t, server.URL+"/gateway/inbound", map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer gw:wrong-token",
+	}, map[string]any{}, nil, http.StatusUnauthorized)
+}
+
+func TestHTTPAdminRoutesRequireToken(t *testing.T) {
+	application := app.New(memory.New())
+	apiServer := httpapi.New(application, nil)
+	server := httptest.NewServer(apiServer.Handler())
+	t.Cleanup(server.Close)
+
+	body := map[string]any{
+		"name":            "Tenant",
+		"vertical":        "roofing",
+		"provider_number": "+61400000000",
+		"operator_id":     "op_telegram:x",
+	}
+
+	// No admin token configured at all → 503 default-deny (control plane closed).
+	postWithHeaders(t, server.URL+"/admin/tenants", map[string]string{
+		"Content-Type": "application/json",
+	}, body, nil, http.StatusServiceUnavailable)
+
+	// Configure a token; missing or incorrect Authorization → 401.
+	apiServer.SetAdminToken("right-admin-token")
+	postWithHeaders(t, server.URL+"/admin/tenants", map[string]string{
+		"Content-Type": "application/json",
+	}, body, nil, http.StatusUnauthorized)
+	postWithHeaders(t, server.URL+"/admin/tenants", map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer admin:wrong-token",
+	}, body, nil, http.StatusUnauthorized)
+
+	// Correct token → provisions.
+	postWithHeaders(t, server.URL+"/admin/tenants", map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer admin:right-admin-token",
+	}, body, nil, http.StatusCreated)
+}
+
+// testAdminToken is the shared secret the e2e suite configures on every server
+// to exercise the authenticated /admin/* control-plane routes.
+const testAdminToken = "test-admin-token"
+
+// adminPost calls a privileged /admin/* route with the admin bearer token.
+func adminPost(t *testing.T, url string, body any, out any, wantStatus int) {
+	t.Helper()
+	postWithHeaders(t, url, map[string]string{
+		"Content-Type":  "application/json",
+		"Authorization": "Bearer admin:" + testAdminToken,
+	}, body, out, wantStatus)
 }
 
 func post(t *testing.T, url string, tenantID string, body any, out any, wantStatus int) {

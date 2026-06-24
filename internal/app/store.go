@@ -3,7 +3,7 @@ package app
 import (
 	"context"
 
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 type Store interface {

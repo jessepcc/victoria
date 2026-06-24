@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"victoria/internal/channel"
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 func TestRenderTextPreservesBodyOnly(t *testing.T) {
@@ -86,10 +86,10 @@ func TestParseJIDAcceptsPhoneAndFullJID(t *testing.T) {
 }
 
 func TestNewRequiresPostgresAndDispatcher(t *testing.T) {
-	if _, err := New(nil, Config{}); err == nil {
+	if _, err := New(context.Background(), Config{}); err == nil {
 		t.Fatal("expected error for empty config")
 	}
-	if _, err := New(nil, Config{PostgresDSN: "x"}); err == nil {
+	if _, err := New(context.Background(), Config{PostgresDSN: "x"}); err == nil {
 		t.Fatal("expected error for missing inbound dispatcher")
 	}
 }
@@ -155,6 +155,22 @@ func TestA0OutboundGuardBlocksCustomerRecipients(t *testing.T) {
 	}
 	if len(sender.sent) != 1 {
 		t.Fatalf("allowed send count = %d, want 1", len(sender.sent))
+	}
+
+	// Per OQ-2 RESOLVED, the operator can choose a separate draft-delivery JID.
+	// The guard must allow that destination, otherwise A0 approval flow breaks.
+	bindingWithDraft := binding
+	bindingWithDraft.DraftDeliveryJID = "85270000000@s.whatsapp.net"
+	if _, err := guarded.SendOutboundWithBinding(context.Background(), bindingWithDraft, channel.OutboundMessage{
+		TenantID:            "t_1",
+		RecipientIdentifier: "85270000000@s.whatsapp.net",
+		BodyText:            "approved draft for forwarding",
+		IdempotencyKey:      "allowed-draft",
+	}); err != nil {
+		t.Fatalf("draft delivery JID blocked: %v", err)
+	}
+	if len(sender.sent) != 2 {
+		t.Fatalf("after draft delivery, sent = %d, want 2", len(sender.sent))
 	}
 }
 

@@ -1,4 +1,4 @@
-module victoria
+module github.com/jessepcc/victoria
 
 go 1.26
 

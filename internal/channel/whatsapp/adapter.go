@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "github.com/jackc/pgx/v5/stdlib" // registers the pgx driver for whatsmeow's database/sql sqlstore
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
@@ -34,8 +34,8 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
-	"victoria/internal/channel"
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 // SessionUpdate is fed to the Manager's status callback when a tenant's
@@ -105,7 +105,7 @@ func NewGuardedAdapter(sender OutboundSender, auditor OutboundBlockAuditor) *Gua
 }
 
 func (g *GuardedAdapter) SendOutboundWithBinding(ctx context.Context, binding domain.ChannelBinding, msg channel.OutboundMessage) (channel.DeliveryReceipt, error) {
-	if err := enforceA0OutboundGuard(ctx, binding, msg.RecipientIdentifier, msg.BodyText, func(ctx context.Context, tenantID, dstJID, bodyHash, callSite string) error {
+	if err := EnforceA0OutboundGuard(ctx, binding, msg.RecipientIdentifier, msg.BodyText, func(ctx context.Context, tenantID, dstJID, bodyHash, callSite string) error {
 		if g.auditor == nil {
 			return nil
 		}
@@ -191,10 +191,19 @@ func (m *Manager) SendOutbound(ctx context.Context, msg channel.OutboundMessage)
 	if !ok {
 		return channel.DeliveryReceipt{}, channel.ErrAdapterNotAvailable
 	}
-	if tc.cli == nil || !tc.cli.IsConnected() || tc.status != domain.SessionActive {
+	// Snapshot the session fields under the per-client lock: the whatsmeow event
+	// handler mutates status/recipient on another goroutine (see publish and
+	// handleEvent). Release the lock before any network call.
+	tc.mu.Lock()
+	cli := tc.cli
+	status := tc.status
+	to := tc.recipient
+	device := tc.device
+	tc.mu.Unlock()
+
+	if cli == nil || !cli.IsConnected() || status != domain.SessionActive {
 		return channel.DeliveryReceipt{}, channel.ErrSessionNotConnected
 	}
-	to := tc.recipient
 	if msg.RecipientIdentifier != "" {
 		jid, err := parseJID(msg.RecipientIdentifier)
 		if err != nil {
@@ -207,20 +216,20 @@ func (m *Manager) SendOutbound(ctx context.Context, msg channel.OutboundMessage)
 		if err != nil {
 			return channel.DeliveryReceipt{}, err
 		}
-		if err := enforceA0OutboundGuard(ctx, binding, to.String(), msg.BodyText, m.cfg.AuditOutboundBlocked); err != nil {
+		if err := EnforceA0OutboundGuard(ctx, binding, to.String(), msg.BodyText, m.cfg.AuditOutboundBlocked); err != nil {
 			return channel.DeliveryReceipt{}, err
 		}
 	}
 	// WhatsApp's self-chat ("Message Yourself") silently drops interactive
 	// List Messages. When the recipient is our own account JID, downgrade to
 	// the numbered-text fallback that spec §4.6 documents.
-	selfChat := tc.device != nil && tc.device.ID != nil && to.User == tc.device.ID.User
+	selfChat := device != nil && device.ID != nil && to.User == device.ID.User
 	wamsg := buildOutboundMessage(msg, selfChat)
-	resp, err := tc.cli.SendMessage(ctx, to, wamsg, whatsmeow.SendRequestExtra{ID: msg.IdempotencyKey})
+	resp, err := cli.SendMessage(ctx, to, wamsg, whatsmeow.SendRequestExtra{ID: msg.IdempotencyKey})
 	if err != nil {
 		return channel.DeliveryReceipt{}, fmt.Errorf("whatsapp: send: %w", err)
 	}
-	return channel.DeliveryReceipt{ProviderMessageID: string(resp.ID), SentAt: resp.Timestamp}, nil
+	return channel.DeliveryReceipt{ProviderMessageID: resp.ID, SentAt: resp.Timestamp}, nil
 }
 
 // NormalizeInboundWebhook is unused for WhatsApp (no webhook surface — events
@@ -328,9 +337,26 @@ func (m *Manager) BeginPairing(ctx context.Context, tenantID string) (string, er
 		m.publish(tc, domain.SessionQRNeeded)
 		return code, nil
 	case <-time.After(15 * time.Second):
+		m.abortPairing(tenantID, tc)
 		return "", errors.New("whatsapp: timed out waiting for first QR")
 	case <-ctx.Done():
+		m.abortPairing(tenantID, tc)
 		return "", ctx.Err()
+	}
+}
+
+// abortPairing tears down a pairing attempt that never produced a usable QR
+// (manager-side timeout or caller cancellation). It removes the half-installed
+// client so a later BeginPairing starts cleanly, and disconnects it to release
+// the socket; the QR pump goroutine exits once whatsmeow closes qrChan.
+func (m *Manager) abortPairing(tenantID string, tc *tenantClient) {
+	m.mu.Lock()
+	if m.clients[tenantID] == tc {
+		delete(m.clients, tenantID)
+	}
+	m.mu.Unlock()
+	if tc.cli != nil {
+		tc.cli.Disconnect()
 	}
 }
 
@@ -497,7 +523,11 @@ func (tc *tenantClient) dispatchInbound(evt *events.Message) {
 		tc.manager.cfg.Logger.Debugf("skipping outbound echo for tenant %s msg=%s", tc.tenantID, evt.Info.ID)
 		return
 	}
-	tc.manager.cfg.Logger.Infof("inbound from tenant=%s sender=%s text=%q button=%q", tc.tenantID, evt.Info.Sender, body, buttonID)
+	// Keep PII (sender JID, message body) out of Info-level logs — it includes
+	// non-allowlisted senders. Log only non-identifying metadata at Info; the
+	// raw content is available at Debug for local troubleshooting.
+	tc.manager.cfg.Logger.Infof("inbound tenant=%s msg=%s button=%q text_len=%d", tc.tenantID, evt.Info.ID, buttonID, len(body))
+	tc.manager.cfg.Logger.Debugf("inbound detail tenant=%s sender=%s text=%q", tc.tenantID, evt.Info.Sender, body)
 	in := channel.InboundMessage{
 		SenderIdentifier:  evt.Info.Sender.User,
 		SenderJID:         evt.Info.Sender.String(),
@@ -568,16 +598,24 @@ func normalizeJIDString(input string) string {
 	return clean + "@" + types.DefaultUserServer
 }
 
-func enforceA0OutboundGuard(ctx context.Context, binding domain.ChannelBinding, recipient, body string, audit func(context.Context, string, string, string, string) error) error {
+// EnforceA0OutboundGuard refuses any A0 (read_only) outbound that isn't
+// destined for the operator's own JID OR their configured draft-delivery JID
+// (per spec OQ-2 RESOLVED). Any block writes outbound_blocked_to_customer via
+// the audit callback.
+func EnforceA0OutboundGuard(ctx context.Context, binding domain.ChannelBinding, recipient, body string, audit func(context.Context, string, string, string, string) error) error {
 	if binding.InboundMode != domain.InboundModeReadOnly {
 		return nil
 	}
 	dst := normalizeJIDString(recipient)
+	if dst == "" {
+		return nil
+	}
 	operator := normalizeJIDString(binding.OperatorJID)
 	if operator == "" {
 		operator = normalizeJIDString(binding.ProviderNumber)
 	}
-	if dst == "" || operator == "" || dst == operator {
+	draftJID := normalizeJIDString(binding.DraftDeliveryJID)
+	if dst == operator || (draftJID != "" && dst == draftJID) {
 		return nil
 	}
 	bodyHash := domain.SHA256Key(body)

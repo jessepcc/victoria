@@ -75,6 +75,11 @@ type ProvisioningManifest struct {
 	MCPEndpoints         map[string]string `json:"mcp_endpoints"`
 	SkillVersionEndpoint string            `json:"skill_version_endpoint"`
 	Vertical             string            `json:"vertical"`
+	// WhatsAppCommandSecret is the single-use secret an A1 operator types in
+	// `register me as operator <secret>` from their own WhatsApp account
+	// (spec §6.2 / OQ-3). Surfaced exactly once at provisioning + on reissue;
+	// never returned by routine binding fetches.
+	WhatsAppCommandSecret string `json:"whatsapp_command_secret,omitempty"`
 }
 
 type WorkflowTemplate struct {

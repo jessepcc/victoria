@@ -9,9 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"victoria/internal/channel"
-	"victoria/internal/domain"
-	"victoria/internal/store/memory"
+	"github.com/jessepcc/victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/channel/whatsapp"
+	"github.com/jessepcc/victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/store/memory"
 )
 
 type sequenceIDs struct {
@@ -120,6 +121,54 @@ func TestGoldenCorrectionPromotionAndFutureRun(t *testing.T) {
 	}
 	if packet.PlannedAction.Type != "hold_and_request_more_info" {
 		t.Fatalf("planned action = %s, want hold_and_request_more_info", packet.PlannedAction.Type)
+	}
+}
+
+// TestChatPathScopeHintReadsFreeText guards the chat-path scope fix: a
+// WhatsApp/Telegram reply carries the operator's "always" intent in free_text
+// only (there is no dedicated follow_up_answer field on that path), so scope
+// detection must fall back to free_text instead of silently dropping it.
+func TestChatPathScopeHintReadsFreeText(t *testing.T) {
+	ctx := context.Background()
+	application, _, _, tenant := newTestApp(t)
+
+	_, packet, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("scope"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := application.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:         "telegram",
+		ProviderNumber:  "+61400000000",
+		PacketID:        packet.PacketID,
+		SourceMessageID: "msg_scope_1",
+		ActionButton:    domain.ActionWrongAction,
+		FreeText:        "always hold for new clients when photos are incomplete",
+		// FollowUpAnswer intentionally empty — this is the chat path.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envelope.ScopeHint == nil || *envelope.ScopeHint != domain.ScopeTenant {
+		t.Fatalf("scope hint = %v, want tenant (free_text 'always' must drive tenant scope on the chat path)", envelope.ScopeHint)
+	}
+}
+
+// TestRemoveStringDoesNotMutateInput guards against in-place filtering: the
+// customer allowlist slice passed to removeString is owned by the store, so the
+// helper must return a fresh slice without corrupting its input.
+func TestRemoveStringDoesNotMutateInput(t *testing.T) {
+	input := []string{"a", "b", "c"}
+	got := removeString(input, "b")
+	if len(got) != 2 || got[0] != "a" || got[1] != "c" {
+		t.Fatalf("removeString = %v, want [a c]", got)
+	}
+	if len(input) != 3 || input[0] != "a" || input[1] != "b" || input[2] != "c" {
+		t.Fatalf("removeString mutated its input: %v", input)
 	}
 }
 
@@ -793,15 +842,27 @@ func TestQueuedPacketNotMarkedDeliveredDuringOutage(t *testing.T) {
 
 // fakeWAAdapter is a stand-in for the whatsmeow Manager used to test the
 // gateway's adapter-aware send + queue + drain path without touching the
-// network.
+// network. When `bindings` is set the fake also applies the production A0
+// outbound guard, so tests catch guard regressions that the real Manager
+// would catch.
 type fakeWAAdapter struct {
 	sentPacketIDs []string
 	sent          []channel.OutboundMessage
 	failNext      bool
+	bindings      func(string) (domain.ChannelBinding, error)
 }
 
 func (*fakeWAAdapter) Channel() channel.Channel { return channel.ChannelWhatsApp }
-func (a *fakeWAAdapter) SendOutbound(_ context.Context, msg channel.OutboundMessage) (channel.DeliveryReceipt, error) {
+func (a *fakeWAAdapter) SendOutbound(ctx context.Context, msg channel.OutboundMessage) (channel.DeliveryReceipt, error) {
+	if a.bindings != nil {
+		binding, err := a.bindings(msg.TenantID)
+		if err != nil {
+			return channel.DeliveryReceipt{}, err
+		}
+		if err := whatsapp.EnforceA0OutboundGuard(ctx, binding, msg.RecipientIdentifier, msg.BodyText, nil); err != nil {
+			return channel.DeliveryReceipt{}, err
+		}
+	}
 	if a.failNext {
 		a.failNext = false
 		return channel.DeliveryReceipt{}, fmt.Errorf("simulated send failure")
@@ -871,7 +932,11 @@ func TestWhatsAppOutageQueuesDurablyAndDrainsOnReconnect(t *testing.T) {
 func TestA0ApprovalDeliversDraftToOperatorOnly(t *testing.T) {
 	ctx := context.Background()
 	application, store, _, tenant := newTestApp(t)
-	wa := &fakeWAAdapter{}
+	wa := &fakeWAAdapter{
+		bindings: func(tenantID string) (domain.ChannelBinding, error) {
+			return store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+		},
+	}
 	application.RegisterChannelAdapter(wa)
 	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
 		InboundMode:      domain.InboundModeReadOnly,
@@ -899,17 +964,23 @@ func TestA0ApprovalDeliversDraftToOperatorOnly(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(wa.sent) != sendCountBeforeApproval+1 {
-		t.Fatalf("approval sends = %d after %d, want one draft delivery", len(wa.sent), sendCountBeforeApproval)
+	// A0 approval delivers TWO messages: an instruction telling the operator
+	// what to do, then the bare draft text — long-press / Forward friendly.
+	if len(wa.sent) != sendCountBeforeApproval+2 {
+		t.Fatalf("approval sends = %d after %d, want two (instruction + draft body)", len(wa.sent), sendCountBeforeApproval)
 	}
-	draft := wa.sent[len(wa.sent)-1]
-	if draft.RecipientIdentifier != "85270000000@s.whatsapp.net" {
-		t.Fatalf("draft recipient = %s, want configured draft delivery JID", draft.RecipientIdentifier)
+	instruction := wa.sent[len(wa.sent)-2]
+	draftBody := wa.sent[len(wa.sent)-1]
+	if instruction.RecipientIdentifier != "85270000000@s.whatsapp.net" || draftBody.RecipientIdentifier != "85270000000@s.whatsapp.net" {
+		t.Fatalf("recipients = (%s, %s), want both = configured draft delivery JID", instruction.RecipientIdentifier, draftBody.RecipientIdentifier)
 	}
-	if !strings.Contains(draft.BodyText, "Approved. Here's the draft") {
-		t.Fatalf("draft body missing approval wrapper: %q", draft.BodyText)
+	if !strings.Contains(instruction.BodyText, "Long-press the next message") {
+		t.Fatalf("instruction message missing forwarding cue: %q", instruction.BodyText)
 	}
-	outbound, err := store.OutboundToCustomerByCaseAndHash(ctx, tenant.ID, run.ID, domain.SHA256Key(draft.BodyText))
+	if strings.Contains(draftBody.BodyText, "Long-press") || strings.Contains(draftBody.BodyText, "──────") {
+		t.Fatalf("draft body must be clean (no instructions, no decorations): %q", draftBody.BodyText)
+	}
+	outbound, err := store.OutboundToCustomerByCaseAndHash(ctx, tenant.ID, run.ID, domain.SHA256Key(draftBody.BodyText))
 	if !errors.Is(err, domain.ErrNotFound) {
 		t.Fatalf("A0 approval wrote outbound_to_customer row: %+v err=%v", outbound, err)
 	}
@@ -980,6 +1051,230 @@ func TestA1ApprovalSendsToCustomerWithMCPGateAndIdempotentRecord(t *testing.T) {
 	events, _ := store.ListAuditEvents(ctx, tenant.ID)
 	if countEvents(events, "customer_outbound_sent") != 1 {
 		t.Fatalf("customer_outbound_sent count = %d, want 1", countEvents(events, "customer_outbound_sent"))
+	}
+}
+
+func TestA0ReviewPacketRoutesToDraftDeliveryJID(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{
+		bindings: func(tenantID string) (domain.ChannelBinding, error) {
+			return store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+		},
+	}
+	application.RegisterChannelAdapter(wa)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode:      domain.InboundModeReadOnly,
+		DraftDeliveryJID: "85270000000@s.whatsapp.net",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+
+	if _, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("a0-routing"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sent) != 1 {
+		t.Fatalf("review packet send count = %d, want 1", len(wa.sent))
+	}
+	if wa.sent[0].RecipientIdentifier != "85270000000@s.whatsapp.net" {
+		t.Fatalf("review packet recipient = %s, want draft_delivery_jid", wa.sent[0].RecipientIdentifier)
+	}
+}
+
+func TestA1ReviewPacketRoutesToFirstCommandIdentity(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{
+		bindings: func(tenantID string) (domain.ChannelBinding, error) {
+			return store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+		},
+	}
+	application.RegisterChannelAdapter(wa)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeFullControl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.RegisterWhatsAppCommandIdentity(ctx, tenant.ID, "61411111111@s.whatsapp.net"); err != nil {
+		t.Fatal(err)
+	}
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+
+	if _, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("a1-routing"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sent) != 1 {
+		t.Fatalf("review packet send count = %d, want 1", len(wa.sent))
+	}
+	// Must NOT route to the dedicated Victoria number (provider_number) — that
+	// would land in Victoria's own self-chat. Route to the operator's JID.
+	if wa.sent[0].RecipientIdentifier != "61411111111@s.whatsapp.net" {
+		t.Fatalf("review packet recipient = %s, want first command identity", wa.sent[0].RecipientIdentifier)
+	}
+}
+
+func TestA1ReviewPacketWithoutCommandIdentityQueuesAndAlerts(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{
+		bindings: func(tenantID string) (domain.ChannelBinding, error) {
+			return store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+		},
+	}
+	application.RegisterChannelAdapter(wa)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeFullControl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+
+	binding, err := store.ChannelBindingByTenant(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := binding.CommandRegistrationSecret
+	if secret == "" {
+		t.Fatal("expected provisioning to set CommandRegistrationSecret")
+	}
+
+	if _, _, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("a1-no-identity"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sent) != 0 {
+		t.Fatalf("packet sent before registration: %d", len(wa.sent))
+	}
+	depth, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if depth != 1 {
+		t.Fatalf("queue depth = %d, want 1 (packet must persist until registration)", depth)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "no_command_identity_registered") != 1 {
+		t.Fatalf("no_command_identity_registered count = %d, want 1", countEvents(events, "no_command_identity_registered"))
+	}
+
+	// Operator registers; queued packet must drain immediately AND land at the
+	// just-registered command identity (not the dedicated Victoria number).
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "61411111111",
+		SenderJID:         "61411111111@s.whatsapp.net",
+		ProviderMessageID: "register-drain",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "register me as operator " + secret,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(wa.sent) == 0 {
+		t.Fatal("queued packet did not drain after registration")
+	}
+	// Drain runs before the success notification, so wa.sent[0] is the packet.
+	if wa.sent[0].RecipientIdentifier != "61411111111@s.whatsapp.net" {
+		t.Fatalf("drained packet recipient = %s, want command identity JID", wa.sent[0].RecipientIdentifier)
+	}
+	depthAfter, _ := store.OutboundQueueDepth(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if depthAfter != 0 {
+		t.Fatalf("queue depth after drain = %d, want 0", depthAfter)
+	}
+}
+
+func TestProvisioningIssuesSingleUseCommandSecret(t *testing.T) {
+	ctx := context.Background()
+	store := memory.New()
+	clock := &mutableClock{now: time.Date(2026, 4, 30, 12, 0, 0, 0, time.UTC)}
+	application := New(store, WithIDs(&sequenceIDs{}), WithClock(clock))
+	tenant, manifest, err := application.ProvisionTenant(ctx, "ABC Roofing", "roofing", "+61400000000", "op_telegram:owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.WhatsAppCommandSecret == "" {
+		t.Fatal("provisioning manifest missing whatsapp_command_secret")
+	}
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeFullControl,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "61411111111",
+		SenderJID:         "61411111111@s.whatsapp.net",
+		ProviderMessageID: "register-1",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "register me as operator " + manifest.WhatsAppCommandSecret,
+		ReceivedAt:        clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := store.ChannelBindingByTenant(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(binding.CommandIdentities, "61411111111@s.whatsapp.net") {
+		t.Fatalf("command identity not registered: %+v", binding.CommandIdentities)
+	}
+	if binding.CommandSecretConsumedAt == nil {
+		t.Fatal("expected CommandSecretConsumedAt to be set after registration")
+	}
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "61422222222",
+		SenderJID:         "61422222222@s.whatsapp.net",
+		ProviderMessageID: "register-replay",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "register me as operator " + manifest.WhatsAppCommandSecret,
+		ReceivedAt:        clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "command_registration_rejected") != 1 {
+		t.Fatalf("command_registration_rejected count = %d, want 1 (replay must be rejected)", countEvents(events, "command_registration_rejected"))
+	}
+	rebinding, err := store.ChannelBindingByTenant(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if containsString(rebinding.CommandIdentities, "61422222222@s.whatsapp.net") {
+		t.Fatal("replay registration was accepted; secret is not single-use")
+	}
+
+	rotated, err := application.ReissueWhatsAppCommandSecret(ctx, tenant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated == manifest.WhatsAppCommandSecret {
+		t.Fatal("reissued secret matches original; rotation not effective")
+	}
+	if err := application.HandleWhatsAppInbound(ctx, tenant.ID, channel.InboundMessage{
+		SenderIdentifier:  "61422222222",
+		SenderJID:         "61422222222@s.whatsapp.net",
+		ProviderMessageID: "register-after-reissue",
+		Channel:           channel.ChannelWhatsApp,
+		FreeText:          "register me as operator " + rotated,
+		ReceivedAt:        clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	final, err := store.ChannelBindingByTenant(ctx, tenant.ID, string(channel.ChannelWhatsApp))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(final.CommandIdentities, "61422222222@s.whatsapp.net") {
+		t.Fatalf("second operator failed to register after reissue: %+v", final.CommandIdentities)
 	}
 }
 
@@ -1137,6 +1432,124 @@ func TestWhatsAppQueueOverflowTombstonesOldest(t *testing.T) {
 	}
 }
 
+func TestLevenshteinForgivesTypicalOperatorTypos(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"phtots", "photo", 2},       // dropped letter + sub
+		{"holdd", "hold", 1},         // doubled letter
+		{"singapor", "singapore", 1}, // missing trailing
+		{"more inf", "more info", 1}, // dropped letter (substring still matches first)
+		{"aplologies", "apologies", 1},
+		{"absolutely", "definitely", 6}, // unrelated → far
+	}
+	for _, tc := range cases {
+		got := levenshtein(tc.a, tc.b)
+		if got != tc.want {
+			t.Errorf("levenshtein(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+func TestContainsOrFuzzyMatchesTypos(t *testing.T) {
+	// The keyword cases used by structuredRuleFromCorrection.
+	cases := []struct {
+		text    string
+		keyword string
+		want    bool
+	}{
+		{"need photos", "photo", true},          // exact substring
+		{"need phtots", "photo", true},          // typo, distance 2
+		{"send phtots ASAP", "photo", true},     // typo embedded in sentence
+		{"hold up please", "hold", true},        // exact
+		{"holdd on", "hold", true},              // doubled letter
+		{"singapor invoice", "singapore", true}, // truncation
+		{"this is fine", "photo", false},        // unrelated
+		{"no", "photo", false},                  // too short to fuzzy-match
+		{"go ahead", "go ahead", true},          // multi-word exact
+		{"go ahed", "go ahead", false},          // multi-word: no fuzzy fallback
+	}
+	for _, tc := range cases {
+		got := containsOrFuzzy(tc.text, tc.keyword)
+		if got != tc.want {
+			t.Errorf("containsOrFuzzy(%q, %q) = %v, want %v", tc.text, tc.keyword, got, tc.want)
+		}
+	}
+}
+
+func TestParseFailureSendsClarificationNotification(t *testing.T) {
+	ctx := context.Background()
+	application, store, _, tenant := newTestApp(t)
+	wa := &fakeWAAdapter{
+		bindings: func(tenantID string) (domain.ChannelBinding, error) {
+			return store.ChannelBindingByTenant(ctx, tenantID, string(channel.ChannelWhatsApp))
+		},
+	}
+	application.RegisterChannelAdapter(wa)
+	if err := application.AcknowledgeWhatsAppConsent(ctx, tenant.ID, AcknowledgeWhatsAppConsentInput{
+		InboundMode: domain.InboundModeReadOnly,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	application.NotifyChannelSession(ctx, tenant.ID, channel.ChannelWhatsApp, domain.SessionActive)
+
+	_, packet, err := application.StartCase(ctx, StartCaseInput{
+		TenantID:     tenant.ID,
+		WorkflowSlug: "quote_drafting",
+		Mode:         domain.ModeSandbox,
+		Payload:      quotePayload("clarification-target"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendCountBeforeReply := len(wa.sent)
+
+	// Reply with text the parser cannot understand.
+	if _, err := application.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:         "whatsapp",
+		ProviderNumber:  "+61400000000",
+		PacketID:        packet.PacketID,
+		SourceMessageID: "garbled-1",
+		ActionButton:    domain.ActionWrongAction,
+		FreeText:        "qwerty zzz",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, _ := store.ListAuditEvents(ctx, tenant.ID)
+	if countEvents(events, "correction_parse_failed") != 1 {
+		t.Fatalf("correction_parse_failed count = %d, want 1", countEvents(events, "correction_parse_failed"))
+	}
+	if len(wa.sent) <= sendCountBeforeReply {
+		t.Fatal("clarification notification not sent after parse failure")
+	}
+	last := wa.sent[len(wa.sent)-1].BodyText
+	if !strings.Contains(last, "didn't quite catch") {
+		t.Fatalf("clarification message missing expected text: %q", last)
+	}
+	if !strings.Contains(last, "qwerty zzz") {
+		t.Fatalf("clarification message missing operator's original text: %q", last)
+	}
+
+	// A SECOND reply with proper text + a different SourceMessageID must
+	// re-create the correction (not be deduped by the previous failure) and
+	// drive learning forward.
+	if _, err := application.ReceiveOperatorReply(ctx, InboundReply{
+		Channel:         "whatsapp",
+		ProviderNumber:  "+61400000000",
+		PacketID:        packet.PacketID,
+		SourceMessageID: "rephrase-1",
+		ActionButton:    domain.ActionWrongAction,
+		FreeText:        "hold and ask for photos",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	candidates, _ := application.ListCandidates(ctx, tenant.ID)
+	if len(candidates) != 1 || candidates[0].RecommendedAction != "hold_and_request_more_info" {
+		t.Fatalf("candidates after rephrase = %+v, want one hold_and_request_more_info", candidates)
+	}
+}
+
 func TestExtractPacketReferenceParsesTag(t *testing.T) {
 	cases := map[string]string{
 		"approve\n[packet:pkt_abc]":    "pkt_abc",
@@ -1146,33 +1559,6 @@ func TestExtractPacketReferenceParsesTag(t *testing.T) {
 	for in, want := range cases {
 		if got := extractPacketReference(in); got != want {
 			t.Fatalf("extractPacketReference(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-func TestGuessButtonFromTextHandlesNumberAndLabel(t *testing.T) {
-	cases := map[string]domain.ActionButton{
-		// Direct numeric/label paths.
-		"1":              domain.ActionApprove,
-		"approve please": domain.ActionApprove,
-		"3":              domain.ActionWrongAction,
-		"add note: hi":   domain.ActionAddNote,
-		// Short positive acknowledgements → approve.
-		"ok":         domain.ActionApprove,
-		"yes":        domain.ActionApprove,
-		"looks good": domain.ActionApprove,
-		"👍":          domain.ActionApprove,
-		// Substantive prose without a recognised approval token →
-		// wrong_action; structured parser downstream extracts the rule.
-		"no, this is from singapore": domain.ActionWrongAction,
-		"send it anyway":             domain.ActionWrongAction,
-		"???":                        domain.ActionWrongAction,
-		// Empty stays empty (would be dead-lettered upstream anyway).
-		"": "",
-	}
-	for in, want := range cases {
-		if got := guessButtonFromText(in); got != want {
-			t.Fatalf("guessButtonFromText(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 type Store struct {
@@ -669,9 +669,9 @@ func (s *Store) ActiveSkillVersion(_ context.Context, tenantID, workflowSlug str
 	if !ok {
 		return domain.SkillVersion{}, domain.ErrNotFound
 	}
-	copy := cloneSkillVersion(sv)
-	copy.WorkflowSlug = workflowSlug
-	return copy, nil
+	out := cloneSkillVersion(sv)
+	out.WorkflowSlug = workflowSlug
+	return out, nil
 }
 
 func (s *Store) GetSkillVersion(_ context.Context, tenantID, skillVersionID string) (domain.SkillVersion, error) {

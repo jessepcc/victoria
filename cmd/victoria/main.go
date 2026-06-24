@@ -5,35 +5,43 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
 
-	"victoria/internal/app"
-	"victoria/internal/channel"
-	"victoria/internal/channel/telegram"
-	"victoria/internal/channel/whatsapp"
-	"victoria/internal/domain"
-	"victoria/internal/httpapi"
-	"victoria/internal/store/memory"
-	"victoria/internal/store/postgres"
+	"github.com/jessepcc/victoria/internal/app"
+	"github.com/jessepcc/victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/channel/telegram"
+	"github.com/jessepcc/victoria/internal/channel/whatsapp"
+	"github.com/jessepcc/victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/httpapi"
+	"github.com/jessepcc/victoria/internal/store/memory"
+	"github.com/jessepcc/victoria/internal/store/postgres"
 )
 
 func main() {
-	ctx := context.Background()
+	// A signal-cancellable context drives graceful shutdown: it cancels on
+	// SIGINT/SIGTERM, draining the HTTP server and stopping the background
+	// PRIV-2 sweeper before deferred Close() calls run.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	addr := os.Getenv("VICTORIA_ADDR")
 	if addr == "" {
 		addr = ":8080"
 	}
 	var store app.Store
+	var pgStore *postgres.Store
 	dsn := os.Getenv("VICTORIA_DATABASE_URL")
 	if dsn != "" {
-		pgStore, err := postgres.Connect(ctx, dsn)
+		s, err := postgres.Connect(ctx, dsn)
 		if err != nil {
 			log.Fatal(err)
 		}
-		defer pgStore.Close()
-		store = pgStore
+		defer s.Close()
+		pgStore = s
+		store = s
 		log.Print("using postgres store")
 	} else {
 		store = memory.New()
@@ -76,18 +84,52 @@ func main() {
 		application.RegisterChannelAdapter(waManager)
 		log.Print("whatsapp adapter active")
 		defer waManager.Close()
+		// Spec §5.7 PRIV-2: bound the worst-case retention window for
+		// non-allowlisted senders' decryption keys. Cadence 15 min ⇒ at most
+		// ~30 min between a non-customer message arriving and its
+		// whatsmeow_message_secrets row being purged.
+		sweeper := whatsapp.NewPRIV2Sweeper(pgStore.Pool(), waLog.Stdout("PRIV2", "INFO", true))
+		go sweeper.Run(ctx)
+		log.Print("priv2 retention sweeper running (cadence 15m)")
 	} else {
 		log.Print("whatsapp adapter disabled (no postgres or VICTORIA_WHATSAPP_DISABLED=1)")
 	}
 
+	apiServer := httpapi.New(application, waManager)
+	gwToken := os.Getenv("VICTORIA_GATEWAY_INBOUND_TOKEN")
+	if gwToken == "" {
+		log.Fatal("VICTORIA_GATEWAY_INBOUND_TOKEN is required (authenticates Telegram-style webhook posts to /gateway/inbound)")
+	}
+	apiServer.SetGatewayInboundToken(gwToken)
+	adminToken := os.Getenv("VICTORIA_ADMIN_TOKEN")
+	if adminToken == "" {
+		log.Fatal("VICTORIA_ADMIN_TOKEN is required (authenticates privileged /admin/* control-plane routes)")
+	}
+	apiServer.SetAdminToken(adminToken)
+	// In production builds (no `-tags dev`) this is a no-op. In dev builds it
+	// registers the fake WhatsApp adapter when no real Manager is up and prints
+	// the warning banner — see dev_helpers_dev.go.
+	enableDevHelpers(application, waManager != nil)
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.New(application, waManager).Handler(),
+		Handler:           apiServer.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
 	}
-	log.Printf("victoria listening on %s", addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+
+	go func() {
+		log.Printf("victoria listening on %s", addr)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("listen: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	stop() // restore default signal handling: a second Ctrl-C force-quits
+	log.Print("shutdown signal received; draining connections...")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown error: %v", err)
 	}
-	_ = domain.SessionActive // keep import
 }

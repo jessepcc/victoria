@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 type Store struct {
@@ -39,6 +39,11 @@ func Connect(ctx context.Context, dsn string) (*Store, error) {
 func (s *Store) Close() {
 	s.pool.Close()
 }
+
+// Pool exposes the underlying connection pool for ancillary jobs that need
+// raw SQL access (e.g. the PRIV-2 retention sweeper deleting from
+// whatsmeow's session tables). The pool's lifetime is owned by the Store.
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 func (s *Store) Migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `

@@ -1,9 +1,10 @@
 package telegram
 
 import (
+	"context"
 	"testing"
 
-	"victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/channel"
 )
 
 func TestNormalizeInboundExtractsButtonAndText(t *testing.T) {
@@ -36,10 +37,10 @@ func TestNormalizeInboundExtractsButtonAndText(t *testing.T) {
 
 func TestSendOutboundRequiresPacketID(t *testing.T) {
 	a := New()
-	if _, err := a.SendOutbound(nil, channel.OutboundMessage{}); err == nil {
+	if _, err := a.SendOutbound(context.Background(), channel.OutboundMessage{}); err == nil {
 		t.Fatal("expected error for empty packet id")
 	}
-	receipt, err := a.SendOutbound(nil, channel.OutboundMessage{PacketID: "p1"})
+	receipt, err := a.SendOutbound(context.Background(), channel.OutboundMessage{PacketID: "p1"})
 	if err != nil {
 		t.Fatal(err)
 	}

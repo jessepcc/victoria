@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"victoria/internal/channel"
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 type InboundReply struct {
@@ -112,9 +112,16 @@ func (g *Gateway) SendNotification(ctx context.Context, tenantID, text string) {
 	if err != nil {
 		return
 	}
+	recipient := operatorRecipient(binding)
+	if recipient == "" {
+		// A1 with no command identity registered yet — drop the notification.
+		// Review packets (which have durable persistence) get the alert audit;
+		// notifications are best-effort and disappear silently.
+		return
+	}
 	_, _ = adapter.SendOutbound(ctx, channel.OutboundMessage{
 		TenantID:            tenantID,
-		RecipientIdentifier: binding.ProviderNumber,
+		RecipientIdentifier: recipient,
 		BodyText:            text,
 		IdempotencyKey:      domain.SHA256Key("notification", tenantID, text, g.clock.Now().Format(time.RFC3339Nano)),
 	})
@@ -154,6 +161,15 @@ func (g *Gateway) SendApprovalPacket(ctx context.Context, packet domain.ReviewPa
 		return err
 	}
 	ch := g.preferredChannel(ctx, packet.TenantID)
+	if !g.hasOperatorRecipient(ctx, packet.TenantID, ch) {
+		// AC-A1.1: A1 binding without a registered command identity. Persist
+		// the packet so it drains after `register me as operator <secret>`,
+		// and emit the alert.
+		_, _ = g.store.CreateAuditEvent(ctx, auditEvent(g.ids, g.clock.Now(), packet.TenantID, "no_command_identity_registered", "system", "gateway", "review_packet", packet.PacketID, nil, map[string]any{
+			"channel": string(ch),
+		}, "no-command-identity", packet.TenantID, packet.PacketID))
+		return g.enqueuePacket(ctx, packet, ch)
+	}
 	if g.canDeliverNow(packet.TenantID, ch) {
 		if err := g.deliverPacket(ctx, packet, ch); err != nil {
 			// Send failed at the adapter — fall back to durable queue so the
@@ -163,6 +179,16 @@ func (g *Gateway) SendApprovalPacket(ctx context.Context, packet domain.ReviewPa
 		return nil
 	}
 	return g.enqueuePacket(ctx, packet, ch)
+}
+
+// hasOperatorRecipient reports whether the binding currently resolves to a
+// non-empty operator JID. False for A1 with no `command_identities` registered.
+func (g *Gateway) hasOperatorRecipient(ctx context.Context, tenantID string, ch channel.Channel) bool {
+	binding, err := g.store.ChannelBindingByTenant(ctx, tenantID, string(ch))
+	if err != nil {
+		return true // missing binding fails downstream; not our concern here
+	}
+	return operatorRecipient(binding) != ""
 }
 
 // preferredChannel resolves a tenant to its primary outbound channel.
@@ -204,7 +230,12 @@ func (g *Gateway) deliverPacket(ctx context.Context, packet domain.ReviewPacket,
 		if err != nil {
 			return fmt.Errorf("gateway: lookup binding: %w", err)
 		}
-		out := channel.RenderPacket(packet, binding.ProviderNumber)
+		recipient := operatorRecipient(binding)
+		if recipient == "" {
+			// A1 with no command identity — leave for next drain.
+			return fmt.Errorf("gateway: no operator recipient registered")
+		}
+		out := channel.RenderPacket(packet, recipient)
 		if _, err := adapter.SendOutbound(ctx, out); err != nil {
 			return fmt.Errorf("gateway: adapter send: %w", err)
 		}
@@ -251,6 +282,23 @@ func (g *Gateway) enqueuePacket(ctx context.Context, packet domain.ReviewPacket,
 		"channel": string(ch),
 	}, "packet-queued", packet.TenantID, packet.PacketID))
 	return nil
+}
+
+// DrainQueue triggers a drain pass for the given tenant/channel without
+// requiring a session-state transition. Used after `register me as operator`
+// success so queued packets that were withheld pending a command identity get
+// delivered immediately. Errors are not propagated; the queue is durable so
+// the next reconnect or registration retries.
+func (g *Gateway) DrainQueue(ctx context.Context, tenantID string, ch channel.Channel) {
+	if !g.canDeliverNow(tenantID, ch) {
+		return
+	}
+	if err := g.drainQueue(ctx, tenantID, ch); err != nil {
+		_, _ = g.store.CreateAuditEvent(ctx, auditEvent(g.ids, g.clock.Now(), tenantID, "outbound_drain_failed", "system", "gateway", "tenant", tenantID, nil, map[string]any{
+			"channel": string(ch),
+			"error":   err.Error(),
+		}, "drain-failed", tenantID, string(ch), g.clock.Now().Format(time.RFC3339Nano)))
+	}
 }
 
 // drainQueue replays pending packets in FIFO order. On adapter send failure
@@ -320,12 +368,24 @@ func (g *Gateway) ReceiveInbound(ctx context.Context, input InboundReply, persis
 	}
 	scopeHint := input.ScopeHint
 	if scopeHint == nil {
-		scopeHint = parseScopeHint(input.FollowUpAnswer)
+		// The webhook path supplies a dedicated follow_up_answer; the chat path
+		// (WhatsApp/Telegram) carries the operator's words in free_text only.
+		// Fall back to free_text so "always"/"this case" scope intent is honored
+		// on both paths rather than silently dropped on chat.
+		answer := input.FollowUpAnswer
+		if answer == "" {
+			answer = input.FreeText
+		}
+		scopeHint = parseScopeHint(answer)
 	}
 	envelope := domain.ApprovalSignalEnvelope{
-		SchemaVersion:       "1",
-		SignalID:            domain.SHA256Key(binding.TenantID, input.PacketID, string(input.ActionButton), input.RawInboundMessageID),
-		IdempotencyKey:      domain.SHA256Key(binding.TenantID, packet.DecisionPointID, input.PacketID, string(input.ActionButton)),
+		SchemaVersion: "1",
+		SignalID:      domain.SHA256Key(binding.TenantID, input.PacketID, string(input.ActionButton), input.RawInboundMessageID),
+		// Include SourceMessageID so a SECOND WA reply (different msg_id, e.g.
+		// after a typo-driven clarification turn) creates a fresh correction
+		// row. Same-msg double-tap is still caught by the SignalID dedup
+		// above (which already includes RawInboundMessageID).
+		IdempotencyKey:      domain.SHA256Key(binding.TenantID, packet.DecisionPointID, input.PacketID, string(input.ActionButton), input.SourceMessageID),
 		PacketID:            input.PacketID,
 		CaseRunID:           packet.CaseRunID,
 		DecisionPointID:     packet.DecisionPointID,

@@ -14,7 +14,7 @@ import (
 	"errors"
 	"time"
 
-	"victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/channel"
 )
 
 type Adapter struct{}

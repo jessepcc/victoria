@@ -2,17 +2,20 @@ package httpapi
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	qrcode "github.com/skip2/go-qrcode"
 
-	"victoria/internal/app"
-	"victoria/internal/channel"
-	"victoria/internal/domain"
+	"github.com/jessepcc/victoria/internal/app"
+	"github.com/jessepcc/victoria/internal/channel"
+	"github.com/jessepcc/victoria/internal/domain"
 )
 
 // WhatsAppManager is the subset of channel/whatsapp.Manager that the HTTP
@@ -26,24 +29,45 @@ type WhatsAppManager interface {
 }
 
 type Server struct {
-	app      *app.App
-	whatsapp WhatsAppManager
+	app                 *app.App
+	whatsapp            WhatsAppManager
+	gatewayInboundToken string
+	adminToken          string
 }
 
 func New(application *app.App, wa WhatsAppManager) *Server {
 	return &Server{app: application, whatsapp: wa}
 }
 
+// SetGatewayInboundToken installs the shared secret that authenticates POSTs
+// to /gateway/inbound (the Telegram-shaped operator-reply webhook). When
+// unset, the route returns 503 — default-deny. Production deployments MUST
+// configure this; cmd/victoria reads VICTORIA_GATEWAY_INBOUND_TOKEN at boot
+// and refuses to start if missing.
+func (s *Server) SetGatewayInboundToken(token string) { s.gatewayInboundToken = token }
+
+// SetAdminToken installs the shared secret that authenticates the privileged
+// /admin/* control-plane routes (tenant provisioning, candidate promotion,
+// replays, command-secret reissue, audit-event reads). Like the gateway token
+// it is default-deny: when unset every admin route returns 503. cmd/victoria
+// reads VICTORIA_ADMIN_TOKEN at boot and refuses to start if missing.
+func (s *Server) SetAdminToken(token string) { s.adminToken = token }
+
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
+	// Recoverer turns a handler panic into a 500 instead of crashing the
+	// process or leaking a stack trace to the client.
+	r.Use(middleware.Recoverer)
 	r.Get("/healthz", s.health)
-	r.Post("/admin/tenants", s.provisionTenant)
-	r.Post("/admin/candidates/{tenant_id}/{candidate_id}/promote", s.promoteCandidate)
-	r.Post("/admin/replays", s.replayCase)
+	r.With(s.adminAuth).Post("/admin/tenants", s.provisionTenant)
+	r.With(s.adminAuth).Post("/admin/candidates/{tenant_id}/{candidate_id}/promote", s.promoteCandidate)
+	r.With(s.adminAuth).Post("/admin/replays", s.replayCase)
+	r.With(s.adminAuth).Post("/admin/channel-bindings/whatsapp/command-secret", s.reissueWhatsAppCommandSecret)
+	r.With(s.adminAuth).Get("/admin/audit-events", s.listAuditEvents)
 	r.With(tenantAuth).Post("/cases", s.startCase)
 	r.With(tenantAuth).Get("/skill-versions/active", s.activeSkillVersion)
 	r.With(tenantAuth).Get("/candidates", s.listCandidates)
-	r.Post("/gateway/inbound", s.gatewayInbound)
+	r.With(s.gatewayInboundAuth).Post("/gateway/inbound", s.gatewayInbound)
 	r.Get("/mcp/tools", s.mcpTools)
 	r.With(tenantAuth).Post("/mcp/write-final", s.mcpWriteFinal)
 	r.With(tenantAuth).Post("/ingest/customer-message", s.ingestCustomerMessage)
@@ -55,6 +79,7 @@ func (s *Server) Handler() http.Handler {
 	r.With(tenantAuth).Get("/channel-bindings/whatsapp/qr.png", s.whatsappQRPNG)
 	r.With(tenantAuth).Get("/channel-bindings/whatsapp/status", s.whatsappStatus)
 	r.With(tenantAuth).Delete("/channel-bindings/whatsapp", s.whatsappLogout)
+	registerDevEndpoints(s, r)
 	return r
 }
 
@@ -101,7 +126,62 @@ func (s *Server) whatsappConsent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"binding": binding})
+	writeJSON(w, http.StatusOK, map[string]any{"binding": redactBinding(binding)})
+}
+
+func (s *Server) reissueWhatsAppCommandSecret(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.TenantID) == "" {
+		writeError(w, domain.ErrInvalidInput)
+		return
+	}
+	secret, err := s.app.ReissueWhatsAppCommandSecret(r.Context(), req.TenantID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"whatsapp_command_secret": secret})
+}
+
+func (s *Server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
+	tenantID := strings.TrimSpace(r.URL.Query().Get("tenant_id"))
+	if tenantID == "" {
+		writeError(w, domain.ErrInvalidInput)
+		return
+	}
+	var eventTypes []string
+	if raw := strings.TrimSpace(r.URL.Query().Get("event_types")); raw != "" {
+		for _, t := range strings.Split(raw, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				eventTypes = append(eventTypes, t)
+			}
+		}
+	}
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	events, err := s.app.ListAuditEvents(r.Context(), tenantID, eventTypes, limit)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"audit_events": events})
+}
+
+// redactBinding strips fields that must never be returned by routine binding
+// reads — namely the WhatsApp command-registration secret, which is meant to
+// be surfaced exactly once at provisioning or reissue.
+func redactBinding(b domain.ChannelBinding) domain.ChannelBinding {
+	b.CommandRegistrationSecret = ""
+	return b
 }
 
 func (s *Server) whatsappAddCustomer(w http.ResponseWriter, r *http.Request) {
@@ -267,12 +347,16 @@ func (s *Server) ingestCustomerMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.TenantID = tenantFromContext(r.Context())
-	caseRunID, err := s.app.IngestCustomerMessage(r.Context(), req)
+	caseRunID, packet, err := s.app.IngestCustomerMessageWithPacket(r.Context(), req)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"case_run_id": caseRunID})
+	body := map[string]any{"case_run_id": caseRunID}
+	if packet.PacketID != "" {
+		body["review_packet"] = packet
+	}
+	writeJSON(w, http.StatusAccepted, body)
 }
 
 func (s *Server) gatewayInbound(w http.ResponseWriter, r *http.Request) {
@@ -360,8 +444,14 @@ func (s *Server) mcpWriteFinal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// maxJSONBodyBytes caps request bodies on every JSON endpoint to bound memory
+// use and reject abusive payloads. 1 MiB is comfortably above any legitimate
+// request shape in this API.
+const maxJSONBodyBytes = 1 << 20
+
 func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) bool {
 	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dest); err != nil {
@@ -407,6 +497,65 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// gatewayInboundAuth guards /gateway/inbound. It is default-deny: if no
+// token is configured, the route returns 503 (the operator-reply webhook is
+// considered closed by default). When configured, requests must carry
+// `Authorization: Bearer gw:<token>` and the comparison is constant-time
+// to avoid leaking the token via timing.
+func (s *Server) gatewayInboundAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.gatewayInboundToken == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error":   "gateway_inbound_disabled",
+				"message": "VICTORIA_GATEWAY_INBOUND_TOKEN is not configured",
+			})
+			return
+		}
+		const prefix = "Bearer gw:"
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, prefix) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		got := []byte(strings.TrimPrefix(auth, prefix))
+		want := []byte(s.gatewayInboundToken)
+		if subtle.ConstantTimeCompare(got, want) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// adminAuth guards the privileged /admin/* control-plane routes. It is
+// default-deny: if no token is configured the routes return 503. When
+// configured, requests must carry `Authorization: Bearer admin:<token>`,
+// compared in constant time to avoid leaking the token via timing.
+func (s *Server) adminAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.adminToken == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error":   "admin_disabled",
+				"message": "VICTORIA_ADMIN_TOKEN is not configured",
+			})
+			return
+		}
+		const prefix = "Bearer admin:"
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, prefix) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		got := []byte(strings.TrimPrefix(auth, prefix))
+		want := []byte(s.adminToken)
+		if subtle.ConstantTimeCompare(got, want) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func tenantAuth(next http.Handler) http.Handler {
