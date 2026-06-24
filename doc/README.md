@@ -1,5 +1,11 @@
 # Documentation
 
+> **For external readers:** these are the design specs written during
+> development, so they read as internal R&D artifacts and use internal section
+> codes (e.g. `P0–P10`, `OQ-n`, `A1–A16`). If you're new to the project, start
+> with the top-level [README](../README.md) and [ARCHITECTURE.md](../ARCHITECTURE.md)
+> — then come here for depth.
+
 ## Reading Order
 
 Start with the product spec, then the tech spec set in the order below.

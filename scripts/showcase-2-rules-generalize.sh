@@ -23,10 +23,9 @@ send_invoice () {
       \"supplier_name\":\"$supplier\",\"supplier_country\":\"$country\",
       \"invoice_amount\":\"$amount\"}}" \
   | python3 -c '
-import json,sys
-d = json.load(sys.stdin)
-p = d["review_packet"]
-print(f"  → packet_id={p[\"packet_id\"]} planned={p[\"planned_action\"][\"type\"]}")
+import json, sys
+p = json.load(sys.stdin)["review_packet"]
+print("  → packet_id={pid} planned={action}".format(pid=p["packet_id"], action=p["planned_action"]["type"]))
 '
 }
 
@@ -35,7 +34,7 @@ count_audit () { psql -d victoria_demo -tA -c "SELECT COUNT(*) FROM audit_events
 wait_for () {
   local what="$1" event="$2" base="$3"
   printf "\n  ⏳ waiting for %s ..." "$what"
-  for i in $(seq 1 60); do
+  for i in $(seq 1 300); do
     n=$(count_audit "$event")
     if [[ "$n" -gt "$base" ]]; then printf " ✓\n"; return; fi
     sleep 2

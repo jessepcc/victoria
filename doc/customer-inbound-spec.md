@@ -10,6 +10,11 @@
 
 Implemented:
 
+- PRIV-2 retention sweep (§5.7 / OQ-1): a goroutine in `cmd/victoria` runs
+  every 15 minutes and purges `whatsmeow_message_secrets` rows whose
+  `chat_jid` is NOT on the tenant's customer allowlist (and is not the
+  operator's self-chat). Bounds the worst-case window for non-customer
+  body reconstruction at ~30 min. A0 only — A1 sessions are exempt.
 - `App.IngestCustomerMessage(ctx, IngestionEvent)` with idempotency on
   `(tenant_id, channel, source_message_id)`, durable `customer_messages`
   storage, automatic `enquiry_triage` case creation, and
@@ -39,12 +44,26 @@ Still deferred or not fully wired:
 - RLS/role-grant hardening beyond the current JSONB-backed migration style.
 - Observability metric emission. Audit events are implemented; Prometheus
   counters/gauges remain future work.
+- `customer_message_filtered` audit emission. Wired into the audit event
+  catalog (§7.3) but only emitted by the deferred 00-channel adapters
+  (web-form, CRM, IMAP `subject_filter_regex`).
 
 Verification:
 
 - `go test ./...`
 - `test/e2e` includes HTTP coverage for customer ingestion, consent, and A0
   allowlist management.
+- Storyline showcases under `scripts/`:
+  - `showcase-4-data-inbound-00.sh` — pure HTTP, exercises 00-channel
+    ingestion + idempotency + operator approval over `/gateway/inbound`.
+  - `showcase-5-data-inbound-a0.sh` — A0 allowlist gate, in-band WA
+    commands, draft-to-operator delivery (uses dev shim).
+  - `showcase-6-data-inbound-a1.sh` — A1 register-via-secret,
+    `no_command_identity_registered` queue + drain, customer outbound +
+    `customer_outbound_sent` (uses dev shim).
+- Dev-only HTTP shim mounted under `/admin/dev/*` when
+  `VICTORIA_DEV_ENDPOINTS=1` (see `cmd/victoria/main.go`). It can impersonate
+  any operator (`IsFromMe=true`) and MUST NOT be enabled in production.
 
 ## 1. Product value (engineering framing)
 
@@ -408,8 +427,10 @@ Spec acknowledges A1-whatsmeow ban risk as **HIGH**. Required infrastructure for
 | `customer_intake_paused` | A0 sender classifier when `pause` active | tenant_id, customer_identifier |
 | `outbound_blocked_to_customer` | A0 outbound guard | dst_jid, call_site_stack, body_hash |
 | `outbound_draft_delivered_to_operator` | A0 approval path | case_run_id, body_hash |
+| `outbound_correction_draft_delivered` | A0 correction path: 2-message forwardable draft sent after a correction whose parser yielded a known recommended_action | correction_id, body_hash, recommended_action |
 | `customer_outbound_sent` | A1 approval path | case_run_id, recipient_jid, body_hash, mcp_approval_audit_id, provider_message_id |
 | `command_registration_rejected` | A1 command-identity flow | sender_jid, reason |
+| `no_command_identity_registered` | A1 review-packet path when no operator JID is registered yet | channel, packet_id |
 | `repair_rate_limited` | A1 repair endpoint | tenant_id, last_repair_at |
 
 All audit events follow the existing immutable-insert-only pattern (postgres trigger + `audit_writer` role per spec correction-loop §11.0).

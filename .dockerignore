@@ -1,0 +1,12 @@
+.git
+.github
+.golangci.yml
+.editorconfig
+Makefile
+Dockerfile
+.dockerignore
+*.test
+coverage.out
+/victoria
+/victoria-dev
+dogfood-output

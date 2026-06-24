@@ -32,12 +32,17 @@ if [[ -z "$PROVIDER_NUMBER" ]]; then
   exit 64
 fi
 
+ADMIN="Authorization: Bearer admin:${VICTORIA_ADMIN_TOKEN:?must export VICTORIA_ADMIN_TOKEN — same value the server was started with}"
 echo "→ Provisioning tenant '$TENANT_NAME' with WhatsApp number $PROVIDER_NUMBER"
 TENANT_JSON=$(curl -fsS -X POST "$ADDR/admin/tenants" \
+  -H "$ADMIN" \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"$TENANT_NAME\",\"vertical\":\"roofing\",\"provider_number\":\"$PROVIDER_NUMBER\",\"operator_id\":\"$OPERATOR_ID\"}")
 TENANT_ID=$(echo "$TENANT_JSON" | python3 -c 'import json,sys;print(json.load(sys.stdin)["tenant"]["id"])')
 echo "  tenant_id=$TENANT_ID"
+# Showcases 1, 2, 3 and demo-story.sh read the active tenant id from this file.
+echo -n "$TENANT_ID" > /tmp/victoria-tenant-id.txt
+echo "  tenant_id saved to /tmp/victoria-tenant-id.txt"
 
 AUTH="Authorization: Bearer tid:$TENANT_ID"
 

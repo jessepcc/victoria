@@ -18,6 +18,7 @@ TENANT_ID_FILE="/tmp/victoria-tenant-id.txt"
 [[ -f "$TENANT_ID_FILE" ]] || { echo "no tenant id at $TENANT_ID_FILE — pair first via scripts/whatsapp-pair.sh" >&2; exit 64; }
 T=$(cat "$TENANT_ID_FILE")
 AUTH="Authorization: Bearer tid:$T"
+ADMIN="Authorization: Bearer admin:${VICTORIA_ADMIN_TOKEN:?must export VICTORIA_ADMIN_TOKEN — same value the server was started with}"
 
 scene () {
   local n="$1" title="$2"
@@ -31,10 +32,10 @@ send_case () {
   local payload="$1"
   curl -fsS -X POST "$ADDR/cases" -H "$AUTH" -H 'Content-Type: application/json' -d "$payload" \
     | python3 -c '
-import json,sys
-d = json.load(sys.stdin)
-print("  packet_id     =", d["review_packet"]["packet_id"])
-print("  planned_action=", d["review_packet"]["planned_action"]["type"])
+import json, sys
+p = json.load(sys.stdin)["review_packet"]
+print("  packet_id     =", p["packet_id"])
+print("  planned_action=", p["planned_action"]["type"])
 '
 }
 
@@ -42,7 +43,7 @@ wait_for_reply () {
   local label="$1" expect_audit="$2"
   echo
   echo "  ⏳ waiting for your $label reply on WhatsApp ..."
-  for i in $(seq 1 60); do
+  for i in $(seq 1 300); do
     n=$(psql -d victoria_demo -tA -c "SELECT COUNT(*) FROM audit_events WHERE tenant_id='$T' AND event_type='$expect_audit'" 2>/dev/null)
     if [[ -n "${prev_count:-}" ]] && [[ "$n" -gt "$prev_count" ]]; then
       echo "  ✓ $expect_audit fired"
@@ -160,6 +161,7 @@ CAND=$(psql -d victoria_demo -tA -c "SELECT id FROM rule_candidates WHERE tenant
 echo "  candidate=$CAND"
 echo "  Promoting via /admin/candidates/{tenant}/{candidate}/promote ..."
 curl -fsS -X POST "$ADDR/admin/candidates/$T/$CAND/promote" \
+  -H "$ADMIN" \
   -H 'Content-Type: application/json' \
   -d '{"reviewer_id":"jesse@victoria","rationale":"three matching corrections from real operator"}' \
   | python3 -c '

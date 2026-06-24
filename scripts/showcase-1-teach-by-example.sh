@@ -20,17 +20,16 @@ prompt_for () { printf "\n  📱 On WhatsApp, reply: %s\n" "$1"; }
 send_case () {
   curl -fsS -X POST "$ADDR/cases" -H "$AUTH" -H 'Content-Type: application/json' -d "$1" \
   | python3 -c '
-import json,sys
-d = json.load(sys.stdin)
-p = d["review_packet"]
-print(f"  → packet_id={p[\"packet_id\"]} planned={p[\"planned_action\"][\"type\"]}")
+import json, sys
+p = json.load(sys.stdin)["review_packet"]
+print("  → packet_id={pid} planned={action}".format(pid=p["packet_id"], action=p["planned_action"]["type"]))
 '
 }
 
 wait_for () {
   local what="$1" event="$2" base="$3"
   printf "\n  ⏳ waiting for %s ..." "$what"
-  for i in $(seq 1 60); do
+  for i in $(seq 1 300); do
     n=$(psql -d victoria_demo -tA -c "SELECT COUNT(*) FROM audit_events WHERE tenant_id='$T' AND event_type='$event'")
     if [[ "$n" -gt "$base" ]]; then printf " ✓\n"; return; fi
     sleep 2
@@ -73,7 +72,7 @@ send_case '{
     "project_summary":"Townhouse roof patch",
     "client_type":"new","photos_complete":false}}'
 prompt_for "N, hold and ask for photos"
-base=$(count_audit correction_received); wait_for "your correction" correction_received "$base"
+base=$(count_audit outbound_correction_draft_delivered); wait_for "correction + draft" outbound_correction_draft_delivered "$base"
 narrator "Victoria should reply: 'Got it — recorded your correction. (1 of 3 matches before I propose a rule.)'"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -86,7 +85,7 @@ send_case '{
     "project_summary":"Re-flash a chimney leak",
     "client_type":"new","photos_complete":false}}'
 prompt_for "N, ask for photos first"
-base=$(count_audit correction_received); wait_for "your correction" correction_received "$base"
+base=$(count_audit outbound_correction_draft_delivered); wait_for "correction + draft" outbound_correction_draft_delivered "$base"
 narrator "Victoria should reply: '(2 of 3 — 1 more to go.)'"
 
 # ─────────────────────────────────────────────────────────────────────
@@ -99,7 +98,7 @@ send_case '{
     "project_summary":"Skylight install + flashing",
     "client_type":"new","photos_complete":false}}'
 prompt_for "N, ask for photos"
-base=$(count_audit correction_received); wait_for "your correction" correction_received "$base"
+base=$(count_audit outbound_correction_draft_delivered); wait_for "correction + draft" outbound_correction_draft_delivered "$base"
 narrator "Victoria should reply with the rule proposal:"
 narrator "  '🔔 That's 3 corrections matching this same case pattern.'"
 narrator "  'I'm flagging a new rule for your review: hold_and_request_more_info.'"
