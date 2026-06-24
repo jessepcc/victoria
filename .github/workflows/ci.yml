@@ -92,7 +92,7 @@ jobs:
 
       - name: golangci-lint
         # action v7+ is required to drive golangci-lint v2 (see .golangci.yml).
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.12.2
 
