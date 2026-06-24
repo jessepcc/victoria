@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues **privately** so they can be fixed before public
-disclosure. Email **bigbugjes@gmail.com** with:
+disclosure. Email **jessechowpc@gmail.com** with:
 
 - a description of the issue and its impact,
 - steps to reproduce (a proof of concept if you have one), and
