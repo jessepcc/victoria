@@ -1,0 +1,41 @@
+# golangci-lint configuration (v2 schema).
+# Run locally with `make lint`. CI runs the same set.
+version: "2"
+
+run:
+  timeout: 5m
+  # Lint both the production and the dev-tagged build so neither rots.
+  build-tags:
+    - dev
+
+linters:
+  # Start from the curated default set (errcheck, govet, ineffassign,
+  # staticcheck, unused) and add a few high-signal extras.
+  default: standard
+  enable:
+    - bodyclose
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # Test files may be a little looser.
+      - path: _test\.go
+        linters:
+          - unparam
+          - revive
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/jessepcc/victoria

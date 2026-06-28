@@ -1,0 +1,16 @@
+/victoria
+/victoria-dev
+coverage.out
+*.test
+
+# Local secrets / config — never commit. Use .env.example as the template.
+.env
+.env.local
+.env.*.local
+
+# Internal R&D / design-vision docs — kept locally, not in the published repo
+/doc/comments.md
+/doc/comments_comparison.md
+/doc/customer-inbound-spec.md
+/doc/sandbox-correction-env-product-spec.md
+/doc/sandbox-tech-spec/

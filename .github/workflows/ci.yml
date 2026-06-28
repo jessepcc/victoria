@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files are not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Build (production)
+        run: go build ./...
+
+      - name: Build (dev tag)
+        run: go build -tags dev ./...
+
+      - name: Vet
+        run: |
+          go vet ./...
+          go vet -tags dev ./...
+
+      - name: Test
+        env:
+          VICTORIA_WHATSAPP_DISABLED: "1"
+        run: go test -race ./...
+
+  integration:
+    name: Postgres integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: victoria_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Integration tests
+        env:
+          VICTORIA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/victoria_test?sslmode=disable
+        # The store self-migrates on Connect(), so no separate migration step.
+        run: go test -count=1 ./internal/store/postgres
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        # action v7+ is required to drive golangci-lint v2 (see .golangci.yml);
+        # v9 runs on Node 24.
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+  vulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    # Non-blocking: govulncheck's source analysis currently panics on Go 1.26
+    # generics (an upstream golang.org/x/tools bug, not a finding in this code).
+    # Kept for visibility in the logs; Dependabot (see .github/dependabot.yml) is
+    # the gating dependency-vulnerability mechanism. Flip back to a required check
+    # once the upstream fix lands.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
